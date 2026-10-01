@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>VR Studio Attendance System Enterprise Attendance & Payroll Suite</title>
+<title>VR Studio Attendance System</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap">
@@ -405,8 +405,8 @@ Today's Live Clock-In Activity Stream
 <div id="printable-payslip" class="p-8 text-slate-800 bg-white">
 <div class="flex justify-between items-start border-b-2 border-slate-800 pb-6">
 <div>
-<h2 class="text-2xl font-black tracking-tight text-slate-900">VR Studio Attendance System Inc.</h2>
-<p class="text-xs text-slate-500 mt-1">100 Enterprise Boulevard, Suite 400</p>
+<h2 class="text-2xl font-black tracking-tight text-slate-900">VR Studio</h2>
+<p class="text-xs text-slate-500 mt-1">Attendance & Payroll System</p>
 <p class="text-xs text-slate-500">Corporate Payroll Services</p>
 </div>
 <div class="text-right">
@@ -450,7 +450,7 @@ Today's Live Clock-In Activity Stream
 </div>
 <div id="payslip-net-pay" class="text-2xl font-black text-emerald-400"></div>
 </div>
-<div class="text-center text-[10px] text-slate-400 mt-6 border-t border-slate-100 pt-4">Computer Generated Payslip. No Signature Required. Confidential - VR Studio Attendance System Enterprise</div>
+<div class="text-center text-[10px] text-slate-400 mt-6 border-t border-slate-100 pt-4">Computer Generated Payslip. No Signature Required. Confidential - VR Studio</div>
 </div>
 </div>
 </div>
@@ -459,7 +459,10 @@ Today's Live Clock-In Activity Stream
 // ===== State: real data is loaded from the server (see backend.js) =====
 let db = { employees: [], attendanceLogs: [], leaveRequests: [] };
 let currentRole = 'admin';
-const getTodayISO = () => new Date().toLocaleDateString('en-CA'); // local date
+
+// Timezone used for all clocks and dates (must match APP_TZ in server.js)
+const APP_TZ = 'Asia/Kolkata';
+const getTodayISO = () => new Date().toLocaleDateString('en-CA', { timeZone: APP_TZ });
 
 // ===== 12-hour time helpers (DB stores "HH:MM" 24h, UI always shows 12h) =====
 const pad2 = n => String(n).padStart(2, '0');
@@ -517,15 +520,15 @@ function punchListHTML(log) {
     </li>`).join('')}</ol>`;
 }
 
-// ===== Live clocks =====
+// ===== Live clocks (always in APP_TZ so they match the punch times) =====
 function setupLiveClocks() {
   function tick() {
     const now = new Date();
-    const t = now.toLocaleTimeString('en-US', { hour12: true, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const t = now.toLocaleTimeString('en-US', { timeZone: APP_TZ, hour12: true, hour: '2-digit', minute: '2-digit', second: '2-digit' });
     document.getElementById('live-header-time').innerText = t;
-    document.getElementById('live-header-date').innerText = now.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+    document.getElementById('live-header-date').innerText = now.toLocaleDateString('en-US', { timeZone: APP_TZ, weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
     document.getElementById('kiosk-live-time').innerText = t;
-    document.getElementById('kiosk-live-date').innerText = now.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' });
+    document.getElementById('kiosk-live-date').innerText = now.toLocaleDateString('en-US', { timeZone: APP_TZ, weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' });
   }
   tick(); setInterval(tick, 1000);
 }

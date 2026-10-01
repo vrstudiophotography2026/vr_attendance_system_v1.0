@@ -5,13 +5,18 @@ const jwt = require('jsonwebtoken');
 
 const SECRET = process.env.JWT_SECRET || 'change-this-secret-in-production';
 const GRACE_MIN = 0; // minutes allowed after shift start before marking LATE (0 = strict)
+
+// All punch times and dates use this timezone, no matter where the server runs (Render = UTC)
+const TZ = process.env.APP_TZ || 'Asia/Kolkata';
+const PORT = process.env.PORT || 3000;
+
 const app = express();
 app.use(express.json());
 // no-store so the browser never keeps an old index.html / backend.js
 app.use(express.static('public', { etag: false, setHeaders: res => res.set('Cache-Control', 'no-store') }));
 
 // ---------- DATABASE ----------
-const db = new DatabaseSync('VR Studio Attendance System.db');
+const db = new DatabaseSync('attendflow.db');
 db.exec(`
 CREATE TABLE IF NOT EXISTS admins(username TEXT PRIMARY KEY, password_hash TEXT);
 CREATE TABLE IF NOT EXISTS employees(
@@ -151,8 +156,18 @@ app.delete('/api/employees/:id', auth, adminOnly, (req, res) => {
 // ---------- ATTENDANCE (multiple punch sessions per day) ----------
 const mins = t => { const [h, m] = t.split(':'); return h * 60 + +m; };
 const hoursBetween = (i, o) => { let h = (mins(o) - mins(i)) / 60; if (h < 0) h += 24; return h; };
-const today = () => new Date().toLocaleDateString('en-CA');
-const nowHM = () => new Date().toTimeString().slice(0, 5);
+
+// Current date/time in the configured timezone (not the server's own timezone)
+const tzParts = () => {
+  const p = {};
+  new Intl.DateTimeFormat('en-GB', {
+    timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+  }).formatToParts(new Date()).forEach(x => { p[x.type] = x.value; });
+  return p;
+};
+const today = () => { const p = tzParts(); return `${p.year}-${p.month}-${p.day}`; };
+const nowHM = () => { const p = tzParts(); return `${p.hour}:${p.minute}`; };
 
 // Rebuild the daily summary row from that day's punch sessions,
 // using THIS employee's own shift for late status and overtime.
@@ -251,4 +266,4 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Server error: ' + (err && err.message ? err.message : 'unknown') });
 });
 
-app.listen(3000, () => console.log('VR Studio Attendance System running on http://localhost:3000'));
+app.listen(PORT, () => console.log(`Attendance system running on port ${PORT} (timezone: ${TZ})`));

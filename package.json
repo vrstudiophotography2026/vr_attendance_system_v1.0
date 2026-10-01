@@ -1,6 +1,6 @@
 {
-  "name": "VR Studio Attendance System",
-  "version": "1.2.0",
+  "name": "vr-attendance-system",
+  "version": "1.3.0",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
   "engines": { "node": ">=22.13" },
