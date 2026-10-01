@@ -203,7 +203,7 @@ Today's Live Clock-In Activity Stream
 <table class="w-full text-left border-collapse">
 <thead>
 <tr class="bg-slate-50 border-b border-slate-200 text-xs font-bold text-slate-500 uppercase tracking-wider">
-<th class="py-3.5 px-4">Employee</th><th class="py-3.5 px-4">Regular Hrs</th><th class="py-3.5 px-4">OT Hrs</th><th class="py-3.5 px-4">Base Pay</th><th class="py-3.5 px-4">OT Pay (1.5x)</th><th class="py-3.5 px-4">Deductions (Tax/Absence)</th><th class="py-3.5 px-4">Net Salary</th><th class="py-3.5 px-4 text-right">Payslip</th>
+<th class="py-3.5 px-4">Employee</th><th class="py-3.5 px-4">Regular Hrs</th><th class="py-3.5 px-4">OT Hrs</th><th class="py-3.5 px-4">Base Pay</th><th class="py-3.5 px-4">OT Pay</th><th class="py-3.5 px-4">Total Salary</th><th class="py-3.5 px-4 text-right">Payslip</th>
 </tr>
 </thead>
 <tbody id="payroll-table-body" class="divide-y divide-slate-100 text-sm"></tbody>
@@ -438,7 +438,7 @@ Today's Live Clock-In Activity Stream
 <button type="button" onclick="closeModal('modal-overtime')" class="text-slate-400 hover:text-white text-lg"><i class="fa-solid fa-xmark"></i></button>
 </div>
 <form id="form-overtime" onsubmit="handleOvertimeSubmit(event)" class="p-6 space-y-4" novalidate>
-<p class="text-xs text-slate-500">Enter the exact time you worked extra today. Only this timing is counted as overtime (paid at 1.5x).</p>
+<p class="text-xs text-slate-500">Enter the exact time you worked extra today. Only this timing is counted as overtime (paid at your normal hourly rate).</p>
 <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
 <div><label class="block text-xs font-bold text-slate-700 uppercase mb-1">Overtime From</label><div id="ot-form-start"></div></div>
 <div><label class="block text-xs font-bold text-slate-700 uppercase mb-1">Overtime To</label><div id="ot-form-end"></div></div>
@@ -491,21 +491,16 @@ Today's Live Clock-In Activity Stream
 <thead><tr class="bg-slate-100 font-bold text-slate-700"><th class="p-2">Description</th><th class="p-2 text-center">Hours / Rate</th><th class="p-2 text-right">Amount</th></tr></thead>
 <tbody class="divide-y divide-slate-100">
 <tr><td class="p-2 font-medium">Regular Work Hours</td><td id="payslip-reg-hours" class="p-2 text-center"></td><td id="payslip-base-pay" class="p-2 text-right font-semibold"></td></tr>
-<tr><td class="p-2 font-medium">Overtime Premium (1.5x)</td><td id="payslip-ot-hours" class="p-2 text-center"></td><td id="payslip-ot-pay" class="p-2 text-right font-semibold"></td></tr>
-<tr class="bg-slate-50 text-slate-600"><td class="p-2 font-bold" colspan="2">Gross Monthly Earnings</td><td id="payslip-gross-pay" class="p-2 text-right font-bold text-slate-900"></td></tr>
+<tr><td class="p-2 font-medium">Overtime Hours (same hourly rate)</td><td id="payslip-ot-hours" class="p-2 text-center"></td><td id="payslip-ot-pay" class="p-2 text-right font-semibold"></td></tr>
+<tr class="bg-slate-50 text-slate-600"><td class="p-2 font-bold" colspan="2">Total Monthly Earnings</td><td id="payslip-gross-pay" class="p-2 text-right font-bold text-slate-900"></td></tr>
 </tbody>
 </table>
-<h4 class="text-xs font-bold uppercase text-slate-500 tracking-wider pt-2">Deductions</h4>
-<table class="w-full text-xs text-left">
-<tbody class="divide-y divide-slate-100">
-<tr><td class="p-2 font-medium">Estimated Taxes & Statutory Withholdings (15%)</td><td id="payslip-deductions" class="p-2 text-right font-semibold text-rose-600"></td></tr>
-</tbody>
-</table>
+
 </div>
 <div class="bg-slate-900 text-white p-4 rounded-xl flex justify-between items-center mt-6">
 <div>
-<div class="text-xs uppercase tracking-widest text-slate-400 font-bold">Total Net Take-Home Pay</div>
-<div class="text-[10px] text-slate-400">Direct Deposited to Registered Bank Account</div>
+<div class="text-xs uppercase tracking-widest text-slate-400 font-bold">Total Salary</div>
+<div class="text-[10px] text-slate-400">Hours worked x hourly rate</div>
 </div>
 <div id="payslip-net-pay" class="text-2xl font-black text-emerald-400"></div>
 </div>
@@ -544,6 +539,11 @@ function fmt12(t) {
   if (!t) return '--:--';
   const [h, m] = t.split(':').map(Number);
   return `${pad2(h % 12 || 12)}:${pad2(m)} ${h >= 12 ? 'PM' : 'AM'}`;
+}
+// Hours as "Xh YYm" (exact to the minute, so 5 minutes shows as 0h 05m)
+function fmtHrs(h) {
+  const t = Math.round((h || 0) * 60);
+  return `${Math.floor(t / 60)}h ${pad2(t % 60)}m`;
 }
 function fmtShift(emp) { return `${fmt12(emp.workStart || '09:00')} – ${fmt12(emp.workEnd || '17:00')}`; }
 
@@ -664,7 +664,7 @@ function renderAdminDashboard() {
   document.getElementById('stat-late-count').innerText = lateCount;
   document.getElementById('stat-leave-count').innerText = leaveCount;
   document.getElementById('stat-absent-count').innerText = absentCount;
-  document.getElementById('stat-overtime-hours').innerText = `${totalOT.toFixed(1)}h`;
+  document.getElementById('stat-overtime-hours').innerText = fmtHrs(totalOT);
 
   const stream = document.getElementById('dashboard-live-stream');
   stream.innerHTML = presentLogs.length === 0
@@ -791,8 +791,8 @@ function renderAttendanceLogs() {
       <td class="py-3 px-4"><div class="font-bold text-slate-800">${emp.name}</div><div class="text-xs text-slate-400 font-mono">${log.empId}</div>${emp.workStart ? `<div class="text-[10px] text-slate-400">Shift ${fmtShift(emp)}</div>` : ''}</td>
       <td class="py-3 px-4 font-mono text-xs text-slate-700 whitespace-nowrap">${fmt12(log.clockIn)}</td>
       <td class="py-3 px-4 font-mono text-xs text-slate-700 whitespace-nowrap">${fmt12(log.clockOut)}</td>
-      <td class="py-3 px-4 font-mono text-xs text-slate-800 font-bold">${(log.hoursWorked || 0).toFixed(1)} hrs</td>
-      <td class="py-3 px-4 text-xs"><div class="font-mono text-indigo-600 font-bold mb-1">${(log.overtimeHours || 0).toFixed(1)} hrs</div>${overtimeSlotsHTML(log, 'None')}</td>
+      <td class="py-3 px-4 font-mono text-xs text-slate-800 font-bold">${fmtHrs(log.hoursWorked)}</td>
+      <td class="py-3 px-4 text-xs"><div class="font-mono text-indigo-600 font-bold mb-1">${fmtHrs(log.overtimeHours)}</div>${overtimeSlotsHTML(log, 'None')}</td>
       <td class="py-3 px-4 text-xs"><div class="font-bold text-slate-800 mb-1">${punchLabel(log.punches)}</div>${punchListHTML(log)}</td>
       <td class="py-3 px-4"><span class="px-2.5 py-1 text-[11px] rounded-md font-bold ${badges[log.status] || 'bg-slate-100 text-slate-700'}">${log.status}</span>${leaveNote}</td>
       <td class="py-3 px-4 text-right">${action}</td>
@@ -836,30 +836,30 @@ function renderLeaveRequests() {
 }
 
 // ===== Payroll =====
-// Regular hours = punched hours. Overtime = ONLY the timing the employee declared (paid at 1.5x).
+// Salary = hours actually worked x hourly rate (even 5 minutes is paid).
+// Overtime hours are paid at the SAME hourly rate as regular hours. No deductions.
 function calcPay(emp, month) {
   const logs = db.attendanceLogs.filter(l => l.empId === emp.id && l.date.startsWith(month));
   const ot = logs.reduce((a, c) => a + (c.overtimeHours || 0), 0);
   const reg = logs.reduce((a, c) => a + (c.hoursWorked || 0), 0);
-  const base = reg * emp.hourlyRate, otPay = ot * emp.hourlyRate * 1.5;
-  const gross = base + otPay, ded = gross * 0.15;
-  return { reg, ot, base, otPay, gross, ded, net: gross - ded };
+  const base = reg * emp.hourlyRate, otPay = ot * emp.hourlyRate;
+  const total = base + otPay;
+  return { reg, ot, base, otPay, total };
 }
 
 function renderPayrollReport() {
   const month = document.getElementById('payroll-month-select').value || getTodayISO().substring(0, 7);
   const tbody = document.getElementById('payroll-table-body');
-  if (!db.employees.length) { tbody.innerHTML = `<tr><td colspan="8" class="p-6 text-center text-slate-400 text-xs">No employees registered yet.</td></tr>`; return; }
+  if (!db.employees.length) { tbody.innerHTML = `<tr><td colspan="7" class="p-6 text-center text-slate-400 text-xs">No employees registered yet.</td></tr>`; return; }
   tbody.innerHTML = db.employees.map(emp => {
     const p = calcPay(emp, month);
     return `<tr class="hover:bg-slate-50">
       <td class="py-3 px-4"><div class="font-bold text-slate-800">${emp.name}</div><div class="text-xs text-slate-400 font-mono">${emp.id} • ₹${emp.hourlyRate}/hr</div></td>
-      <td class="py-3 px-4 font-mono text-xs text-slate-700">${p.reg.toFixed(1)} hrs</td>
-      <td class="py-3 px-4 font-mono text-xs text-indigo-600 font-bold">${p.ot.toFixed(1)} hrs</td>
+      <td class="py-3 px-4 font-mono text-xs text-slate-700">${fmtHrs(p.reg)}</td>
+      <td class="py-3 px-4 font-mono text-xs text-indigo-600 font-bold">${fmtHrs(p.ot)}</td>
       <td class="py-3 px-4 font-mono text-xs text-slate-700">₹${p.base.toFixed(2)}</td>
       <td class="py-3 px-4 font-mono text-xs text-emerald-600 font-bold">₹${p.otPay.toFixed(2)}</td>
-      <td class="py-3 px-4 font-mono text-xs text-rose-600">-₹${p.ded.toFixed(2)}</td>
-      <td class="py-3 px-4 font-mono text-sm font-black text-slate-900">₹${p.net.toFixed(2)}</td>
+      <td class="py-3 px-4 font-mono text-sm font-black text-slate-900">₹${p.total.toFixed(2)}</td>
       <td class="py-3 px-4 text-right"><button onclick="openPayslipModal('${emp.id}','${month}')" class="bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 text-xs font-bold px-2.5 py-1 rounded-lg transition"><i class="fa-solid fa-receipt mr-1"></i> Payslip</button></td>
     </tr>`;
   }).join('');
@@ -867,10 +867,10 @@ function renderPayrollReport() {
 
 function exportPayrollCSV() {
   const month = document.getElementById('payroll-month-select').value || getTodayISO().substring(0, 7);
-  let csv = 'Employee ID,Name,Role,Hourly Rate (INR),Regular Hours,OT Hours,Base Pay,OT Pay,Deductions,Net Salary\n';
+  let csv = 'Employee ID,Name,Role,Hourly Rate (INR),Regular Hours,OT Hours,Base Pay,OT Pay,Total Salary\n';
   db.employees.forEach(e => {
     const p = calcPay(e, month);
-    csv += `"${e.id}","${e.name}","${e.role}",${e.hourlyRate},${p.reg.toFixed(1)},${p.ot.toFixed(1)},${p.base.toFixed(2)},${p.otPay.toFixed(2)},${p.ded.toFixed(2)},${p.net.toFixed(2)}\n`;
+    csv += `"${e.id}","${e.name}","${e.role}",${e.hourlyRate},${p.reg.toFixed(2)},${p.ot.toFixed(2)},${p.base.toFixed(2)},${p.otPay.toFixed(2)},${p.total.toFixed(2)}\n`;
   });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
@@ -884,13 +884,12 @@ function openPayslipModal(empId, month) {
   set('payslip-period', month);
   set('payslip-emp-name', emp.name); set('payslip-emp-role', emp.role);
   set('payslip-emp-id', emp.id); set('payslip-emp-dept', emp.dept);
-  set('payslip-reg-hours', `${p.reg.toFixed(1)} hrs @ ₹${emp.hourlyRate.toFixed(2)}/hr`);
+  set('payslip-reg-hours', `${fmtHrs(p.reg)} @ ₹${emp.hourlyRate.toFixed(2)}/hr`);
   set('payslip-base-pay', `₹${p.base.toFixed(2)}`);
-  set('payslip-ot-hours', `${p.ot.toFixed(1)} hrs @ ₹${(emp.hourlyRate * 1.5).toFixed(2)}/hr`);
+  set('payslip-ot-hours', `${fmtHrs(p.ot)} @ ₹${emp.hourlyRate.toFixed(2)}/hr`);
   set('payslip-ot-pay', `₹${p.otPay.toFixed(2)}`);
-  set('payslip-gross-pay', `₹${p.gross.toFixed(2)}`);
-  set('payslip-deductions', `-₹${p.ded.toFixed(2)}`);
-  set('payslip-net-pay', `₹${p.net.toFixed(2)}`);
+  set('payslip-gross-pay', `₹${p.total.toFixed(2)}`);
+  set('payslip-net-pay', `₹${p.total.toFixed(2)}`);
   openModal('modal-payslip');
 }
 
@@ -996,13 +995,13 @@ function renderEmployeePortal(empId) {
   const openLog = db.attendanceLogs.find(l => l.empId === empId && (l.sessions || []).some(s => !s.out));
   const openSess = openLog ? openLog.sessions.find(s => !s.out) : null;
   set('kiosk-punch-count', log ? (log.punches || 0) : 0);
-  set('kiosk-hours-today', `${(log ? log.hoursWorked || 0 : 0).toFixed(1)} hrs`);
+  set('kiosk-hours-today', fmtHrs(log ? log.hoursWorked : 0));
   document.getElementById('kiosk-sessions').innerHTML = punchListHTML(log);
 
   // Overtime declared today
   const otSlots = log ? (log.overtimeSlots || []) : [];
   document.getElementById('kiosk-ot-today').innerHTML = otSlots.length
-    ? otSlots.map(s => `<div class="font-mono">${fmt12(s.start)} – ${fmt12(s.end)}</div>`).join('') + `<div class="text-[10px] text-slate-500 font-semibold">${(log.overtimeHours || 0).toFixed(1)} hrs total</div>`
+    ? otSlots.map(s => `<div class="font-mono">${fmt12(s.start)} – ${fmt12(s.end)}</div>`).join('') + `<div class="text-[10px] text-slate-500 font-semibold">${fmtHrs(log.overtimeHours)} total</div>`
     : 'None';
 
   if (openSess) {
