@@ -61,7 +61,10 @@
   }
 
   // ---------- data sync ----------
-  async function refresh() { db = await api('/data'); }
+  async function refresh() {
+    db = await api('/data');
+    serverOffset = (db.serverNow || Date.now()) - Date.now();   // keeps break timers in step with the server clock
+  }
   function rerender() {
     if (currentRole === 'admin') {
       renderAdminDashboard(); renderEmployeeDirectory(); renderAttendanceLogs();
@@ -260,6 +263,14 @@
     try { await refresh(); rerender(); } catch {}
     closeModal('modal-overtime');
     toast('Overtime recorded', `${fmt12(start)} – ${fmt12(end)} added to today's attendance.`, 'ok');
+  };
+
+  // ---------- Break (30 min) / Lunch (1 hr): click to start, click again to end ----------
+  window.toggleBreak = async kind => {
+    if (currentRole === 'admin') return;
+    const log = db.attendanceLogs.find(l => l.empId === currentRole && l.date === getTodayISO());
+    const active = log && (log.breakSlots || []).find(b => !b.end);
+    await act(() => api(active ? '/break/end' : '/break/start', 'POST', { kind }));
   };
 
   // ---------- Sudden leave (no application: today turns red with status LEAVE) ----------

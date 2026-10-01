@@ -4,7 +4,12 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
 const SECRET = process.env.JWT_SECRET || 'change-this-secret-in-production';
-const GRACE_MIN = 0; // minutes allowed after shift start before marking LATE (0 = strict)
+// Late rule: LATE only if the first punch-in is MORE than GRACE_MIN minutes after the employee's own shift start
+// (admin sets 10:00 AM, grace 5 -> 10:05 is on time, 10:06 is LATE). Override with env GRACE_MIN.
+const GRACE_MIN = Number(process.env.GRACE_MIN ?? 5);
+// Break / lunch allowance per day. Time taken beyond this is deducted from the day's worked hours.
+const BREAK_ALLOWED_MIN = 30;
+const LUNCH_ALLOWED_MIN = 60;
 
 // All punch times and dates use this timezone, no matter where the server runs (Render = UTC)
 const TZ = process.env.APP_TZ || 'Asia/Kolkata';
@@ -46,6 +51,8 @@ CREATE TABLE IF NOT EXISTS punches(
   id INTEGER PRIMARY KEY AUTOINCREMENT, emp_id TEXT, date TEXT, punch_in TEXT, punch_out TEXT);
 CREATE TABLE IF NOT EXISTS overtime(
   id INTEGER PRIMARY KEY AUTOINCREMENT, emp_id TEXT, date TEXT, ot_start TEXT, ot_end TEXT);
+CREATE TABLE IF NOT EXISTS breaks(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, emp_id TEXT, date TEXT, kind TEXT, start_ms INTEGER, end_ms INTEGER);
 CREATE TABLE IF NOT EXISTS leaves(
   id TEXT PRIMARY KEY, emp_id TEXT, type TEXT, start_date TEXT, end_date TEXT,
   reason TEXT, status TEXT DEFAULT 'PENDING', seen INTEGER DEFAULT 0);
@@ -55,6 +62,9 @@ try { db.exec('ALTER TABLE attendance ADD COLUMN punches INTEGER DEFAULT 0'); } 
 try { db.exec("ALTER TABLE employees ADD COLUMN work_start TEXT DEFAULT '09:00'"); } catch {}
 try { db.exec("ALTER TABLE employees ADD COLUMN work_end TEXT DEFAULT '17:00'"); } catch {}
 try { db.exec('ALTER TABLE employees ADD COLUMN joined TEXT'); } catch {}
+try { db.exec('ALTER TABLE attendance ADD COLUMN break_min REAL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE attendance ADD COLUMN lunch_min REAL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE attendance ADD COLUMN deduct REAL DEFAULT 0'); } catch {}
 // Old employees: "joined" = their first attendance date, or today if they have none
 db.prepare(`UPDATE employees SET joined = COALESCE(
   (SELECT MIN(date) FROM attendance WHERE attendance.emp_id = employees.id), ?) WHERE joined IS NULL`).run(today());
@@ -80,11 +90,13 @@ const E = r => ({
   id: r.id, name: r.name, dept: r.dept, role: r.role, hourlyRate: r.hourly_rate,
   workStart: r.work_start || '09:00', workEnd: r.work_end || '17:00', joined: r.joined || null
 });
-const L = (r, sess, ots) => ({
+const L = (r, sess, ots, brs) => ({
   id: r.id, empId: r.emp_id, date: r.date, clockIn: r.clock_in, clockOut: r.clock_out,
   hoursWorked: r.hours, overtimeHours: r.ot, status: r.status, punches: r.punches || 0,
   sessions: sess[r.emp_id + '|' + r.date] || [],
-  overtimeSlots: ots[r.emp_id + '|' + r.date] || []
+  overtimeSlots: ots[r.emp_id + '|' + r.date] || [],
+  breakMinutes: r.break_min || 0, lunchMinutes: r.lunch_min || 0, deductedHours: r.deduct || 0,
+  breakSlots: brs[r.emp_id + '|' + r.date] || []
 });
 const V = r => ({
   id: r.id, empId: r.emp_id, type: r.type, startDate: r.start_date, endDate: r.end_date,
@@ -139,10 +151,15 @@ app.get('/api/data', auth, (req, res) => {
   const otRows = a ? q('SELECT * FROM overtime ORDER BY ot_start, id') : q('SELECT * FROM overtime WHERE emp_id=? ORDER BY ot_start, id', id);
   const ots = {};
   otRows.forEach(o => (ots[o.emp_id + '|' + o.date] ||= []).push({ start: o.ot_start, end: o.ot_end, hours: hoursBetween(o.ot_start, o.ot_end) }));
+  const brRows = a ? q('SELECT * FROM breaks ORDER BY start_ms, id') : q('SELECT * FROM breaks WHERE emp_id=? ORDER BY start_ms, id', id);
+  const brs = {};
+  brRows.forEach(b => (brs[b.emp_id + '|' + b.date] ||= []).push({ kind: b.kind, start: b.start_ms, end: b.end_ms }));
   res.json({
     employees: (a ? q('SELECT * FROM employees ORDER BY id') : q('SELECT * FROM employees WHERE id=?', id)).map(E),
-    attendanceLogs: (a ? q('SELECT * FROM attendance ORDER BY date DESC, rowid DESC') : q('SELECT * FROM attendance WHERE emp_id=? ORDER BY date DESC', id)).map(r => L(r, sess, ots)),
-    leaveRequests: (a ? q('SELECT * FROM leaves ORDER BY rowid DESC') : q('SELECT * FROM leaves WHERE emp_id=? ORDER BY rowid DESC', id)).map(V)
+    attendanceLogs: (a ? q('SELECT * FROM attendance ORDER BY date DESC, rowid DESC') : q('SELECT * FROM attendance WHERE emp_id=? ORDER BY date DESC', id)).map(r => L(r, sess, ots, brs)),
+    leaveRequests: (a ? q('SELECT * FROM leaves ORDER BY rowid DESC') : q('SELECT * FROM leaves WHERE emp_id=? ORDER BY rowid DESC', id)).map(V),
+    config: { graceMin: GRACE_MIN, breakMin: BREAK_ALLOWED_MIN, lunchMin: LUNCH_ALLOWED_MIN },
+    serverNow: Date.now()
   });
 });
 
@@ -186,6 +203,7 @@ app.put('/api/employees/:id', auth, adminOnly, (req, res) => {
 app.delete('/api/employees/:id', auth, adminOnly, (req, res) => {
   run('DELETE FROM punches WHERE emp_id=?', req.params.id);
   run('DELETE FROM overtime WHERE emp_id=?', req.params.id);
+  run('DELETE FROM breaks WHERE emp_id=?', req.params.id);
   run('DELETE FROM attendance WHERE emp_id=?', req.params.id);
   run('DELETE FROM leaves WHERE emp_id=?', req.params.id);
   run('DELETE FROM employees WHERE id=?', req.params.id);
@@ -195,8 +213,9 @@ app.delete('/api/employees/:id', auth, adminOnly, (req, res) => {
 // ---------- ATTENDANCE (multiple punch sessions per day) ----------
 
 // Rebuild the daily summary row from that day's punch sessions.
-// LATE/PRESENT uses THIS employee's own shift start.
-// Overtime is ONLY the timing the employee declared (overtime table) - never automatic.
+// - LATE only if the first punch-in is later than THIS employee's shift start + GRACE_MIN minutes.
+// - Hours worked = punched hours minus the break / lunch time that went OVER the allowance.
+// - Overtime is ONLY the timing the employee declared (overtime table) - never automatic.
 function recalc(empId, date) {
   const ps = q('SELECT * FROM punches WHERE emp_id=? AND date=? ORDER BY punch_in, id', empId, date);
   const ex = one('SELECT id FROM attendance WHERE emp_id=? AND date=?', empId, date);
@@ -205,20 +224,42 @@ function recalc(empId, date) {
   const emp = one('SELECT work_start FROM employees WHERE id=?', empId) || {};
   const ws = emp.work_start || '09:00';
 
-  const hours = ps.reduce((a, p) => a + (p.punch_out ? hoursBetween(p.punch_in, p.punch_out) : 0), 0);
+  const gross = ps.reduce((a, p) => a + (p.punch_out ? hoursBetween(p.punch_in, p.punch_out) : 0), 0);
+
+  // Break / lunch minutes used today (a break still running counts up to now)
+  const now = Date.now();
+  let brk = 0, lun = 0;
+  q('SELECT * FROM breaks WHERE emp_id=? AND date=?', empId, date).forEach(b => {
+    const m = Math.max(0, ((b.end_ms || now) - b.start_ms) / 60000);
+    if (b.kind === 'LUNCH') lun += m; else brk += m;
+  });
+  const deduct = (Math.max(0, brk - BREAK_ALLOWED_MIN) + Math.max(0, lun - LUNCH_ALLOWED_MIN)) / 60;
+  const hours = Math.max(0, gross - deduct);
+
   const ot = q('SELECT * FROM overtime WHERE emp_id=? AND date=?', empId, date)
     .reduce((a, o) => a + hoursBetween(o.ot_start, o.ot_end), 0);
   const first = ps[0].punch_in, last = ps[ps.length - 1];
   const out = last.punch_out || null;                                   // null = currently punched in
   const count = ps.length + ps.filter(p => p.punch_out).length;          // every IN and every OUT
   const status = mins(first) > mins(ws) + GRACE_MIN ? 'LATE' : 'PRESENT';
-  if (ex) run('UPDATE attendance SET clock_in=?, clock_out=?, hours=?, ot=?, punches=?, status=? WHERE id=?', first, out, hours, ot, count, status, ex.id);
-  else run('INSERT INTO attendance(id,emp_id,date,clock_in,clock_out,hours,ot,status,punches) VALUES(?,?,?,?,?,?,?,?,?)',
-    'LOG-' + Date.now(), empId, date, first, out, hours, ot, status, count);
+  if (ex) run('UPDATE attendance SET clock_in=?, clock_out=?, hours=?, ot=?, punches=?, status=?, break_min=?, lunch_min=?, deduct=? WHERE id=?',
+    first, out, hours, ot, count, status, brk, lun, deduct, ex.id);
+  else run('INSERT INTO attendance(id,emp_id,date,clock_in,clock_out,hours,ot,status,punches,break_min,lunch_min,deduct) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+    'LOG-' + Date.now(), empId, date, first, out, hours, ot, status, count, brk, lun, deduct);
+}
+
+// Close any break / lunch still running for that employee (used at punch-out)
+function closeBreaks(empId, date, atMs) {
+  run('UPDATE breaks SET end_ms=? WHERE emp_id=? AND date=? AND end_ms IS NULL', atMs, empId, date);
 }
 
 // Sessions left open on an earlier day (forgot to punch out) are closed at 23:59 so nobody gets locked out
 function closeStale(empId) {
+  // A break forgotten on an earlier day ends after its normal allowance (no penalty for forgetting)
+  q('SELECT * FROM breaks WHERE emp_id=? AND end_ms IS NULL AND date<>?', empId, today()).forEach(b => {
+    run('UPDATE breaks SET end_ms=? WHERE id=?', b.start_ms + (b.kind === 'LUNCH' ? LUNCH_ALLOWED_MIN : BREAK_ALLOWED_MIN) * 60000, b.id);
+    recalc(b.emp_id, b.date);
+  });
   const stale = q('SELECT * FROM punches WHERE emp_id=? AND punch_out IS NULL AND date<>?', empId, today());
   stale.forEach(p => {
     run('UPDATE punches SET punch_out=? WHERE id=?', '23:59', p.id);
@@ -253,6 +294,7 @@ app.post('/api/clock-out', auth, empOnly, (req, res) => {
     if (staleClosed) { broadcast(); return res.json({ ok: true, note: 'Previous open session closed' }); }
     return res.status(400).json({ error: 'You are not punched in.' });
   }
+  closeBreaks(req.user.id, d, Date.now());                 // punching out ends a running break / lunch
   run('UPDATE punches SET punch_out=? WHERE id=?', nowHM(), open.id);
   recalc(req.user.id, d);
   broadcast(); res.json({ ok: true });
@@ -275,6 +317,31 @@ app.post('/api/overtime', auth, empOnly, (req, res) => {
   if (clash) return res.status(400).json({ error: 'This overlaps an overtime slot you already added today.' });
   run('INSERT INTO overtime(emp_id,date,ot_start,ot_end) VALUES(?,?,?,?)', id, d, start, end);
   recalc(id, d);
+  broadcast(); res.json({ ok: true });
+});
+
+// ---------- BREAK (30 min) / LUNCH (1 hr): free up to the allowance, extra is deducted from the day's hours ----------
+app.post('/api/break/start', auth, empOnly, (req, res) => {
+  const id = req.user.id, d = today();
+  const kind = String((req.body || {}).kind || '').toUpperCase();
+  if (!['BREAK', 'LUNCH'].includes(kind)) return res.status(400).json({ error: 'Choose break or lunch' });
+  closeStale(id);
+  if (onApprovedLeave(id, d)) return res.status(400).json({ error: 'You are on leave today.' });
+  if (!one('SELECT 1 FROM punches WHERE emp_id=? AND date=? AND punch_out IS NULL', id, d))
+    return res.status(400).json({ error: 'Punch in first. You can take a break only while punched in.' });
+  if (one('SELECT 1 FROM breaks WHERE emp_id=? AND end_ms IS NULL', id))
+    return res.status(400).json({ error: 'You are already on a break. End it first.' });
+  run('INSERT INTO breaks(emp_id,date,kind,start_ms) VALUES(?,?,?,?)', id, d, kind, Date.now());
+  recalc(id, d);
+  broadcast(); res.json({ ok: true });
+});
+
+app.post('/api/break/end', auth, empOnly, (req, res) => {
+  const id = req.user.id;
+  const b = one('SELECT * FROM breaks WHERE emp_id=? AND end_ms IS NULL ORDER BY id DESC', id);
+  if (!b) return res.status(400).json({ error: 'You are not on a break.' });
+  run('UPDATE breaks SET end_ms=? WHERE id=?', Date.now(), b.id);
+  recalc(id, b.date);
   broadcast(); res.json({ ok: true });
 });
 
@@ -312,6 +379,7 @@ app.delete('/api/attendance/:id', auth, adminOnly, (req, res) => {
   if (row) {
     run('DELETE FROM punches WHERE emp_id=? AND date=?', row.emp_id, row.date);
     run('DELETE FROM overtime WHERE emp_id=? AND date=?', row.emp_id, row.date);
+    run('DELETE FROM breaks WHERE emp_id=? AND date=?', row.emp_id, row.date);
     if (row.status === 'ON_LEAVE')
       run("DELETE FROM leaves WHERE emp_id=? AND type='Sudden Leave' AND start_date=? AND end_date=?", row.emp_id, row.date, row.date);
   }
@@ -346,7 +414,7 @@ app.patch('/api/leaves/:id/seen', auth, empOnly, (req, res) => {
 });
 
 // Open /api/version in the browser to confirm the NEW server.js is the one running
-app.get('/api/version', (req, res) => res.json({ version: '1.5.1', features: ['overtime', 'leave-today'] }));
+app.get('/api/version', (req, res) => res.json({ version: '1.6.0', features: ['overtime', 'leave-today', 'break-lunch', 'grace'] }));
 
 // Unknown API route -> readable JSON instead of an HTML 404 page
 app.use('/api', (req, res) => res.status(404).json({
