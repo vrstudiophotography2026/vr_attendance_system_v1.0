@@ -11,9 +11,54 @@
       body: body ? JSON.stringify(body) : undefined
     });
     const j = await r.json().catch(() => ({}));
+    if (r.status === 404 && !j.error)
+      throw new Error('Server does not have this feature yet (404). Replace server.js with the latest version and restart the server.');
     if (!r.ok) throw new Error(j.error || `Request failed (${r.status})`);
     return j;
   };
+
+  // ---------- toast notifications ----------
+  document.body.insertAdjacentHTML('beforeend',
+    `<div id="toast-wrap" class="fixed top-20 right-4 z-[80] space-y-3 w-80 max-w-[calc(100vw-2rem)]"></div>`);
+
+  // kind: ok (green) | bad (red) | info (blue). Stays until closed.
+  function toast(title, msg, kind, onClose) {
+    const styles = {
+      ok:   { box: 'bg-emerald-50 border-emerald-400', t: 'text-emerald-800', icon: 'fa-circle-check text-emerald-600' },
+      bad:  { box: 'bg-rose-50 border-rose-400',       t: 'text-rose-800',    icon: 'fa-circle-xmark text-rose-600' },
+      info: { box: 'bg-blue-50 border-blue-400',       t: 'text-blue-800',    icon: 'fa-circle-info text-blue-600' }
+    }[kind || 'info'];
+    const el = document.createElement('div');
+    el.className = `toast-in border-l-4 rounded-xl shadow-lg p-4 flex gap-3 ${styles.box}`;
+    el.innerHTML = `<i class="fa-solid ${styles.icon} text-xl mt-0.5"></i>
+      <div class="flex-1 min-w-0">
+        <div class="font-bold text-sm ${styles.t}"></div>
+        <div class="text-xs text-slate-600 mt-0.5"></div>
+      </div>
+      <button type="button" class="text-slate-400 hover:text-slate-700 self-start"><i class="fa-solid fa-xmark"></i></button>`;
+    el.children[1].children[0].textContent = title;
+    el.children[1].children[1].textContent = msg;
+    el.querySelector('button').onclick = () => { el.remove(); if (onClose) onClose(); };
+    $('toast-wrap').appendChild(el);
+  }
+
+  // Employee: show a pop-up for every leave decision they have not seen yet
+  const shownDecisions = new Set();
+  function checkLeaveNotifications() {
+    if (currentRole === 'admin') return;
+    db.leaveRequests
+      .filter(r => r.status !== 'PENDING' && !r.seen && !shownDecisions.has(r.id + ':' + r.status))
+      .forEach(r => {
+        shownDecisions.add(r.id + ':' + r.status);
+        const ok = r.status === 'APPROVED';
+        toast(
+          ok ? 'Leave Approved' : 'Leave Rejected',
+          `Your ${r.type} request (${r.startDate} to ${r.endDate}) was ${ok ? 'approved' : 'rejected'} by the administrator.`,
+          ok ? 'ok' : 'bad',
+          () => api(`/leaves/${r.id}/seen`, 'PATCH').catch(() => {})   // marked as seen when closed
+        );
+      });
+  }
 
   // ---------- data sync ----------
   async function refresh() { db = await api('/data'); }
@@ -21,7 +66,10 @@
     if (currentRole === 'admin') {
       renderAdminDashboard(); renderEmployeeDirectory(); renderAttendanceLogs();
       renderLeaveRequests(); renderPayrollReport();
-    } else renderEmployeePortal(currentRole);
+    } else {
+      renderEmployeePortal(currentRole);
+      checkLeaveNotifications();
+    }
   }
   async function act(fn) {
     let err;
@@ -97,12 +145,14 @@
         : { as: pendingRole, password: $('login-pass').value };
       const r = await api('/login', 'POST', body);
       token = r.token; currentRole = pendingRole; authedRole = pendingRole;
+      $('toast-wrap').innerHTML = ''; shownDecisions.clear();   // fresh notifications for the new user
       await refresh(); connectLive();
       clearInterval(poll);
       poll = setInterval(() => refresh().then(rerender).catch(() => {}), 15000); // fallback if live stream drops
       $('modal-login').classList.add('hidden');
       setAppVisible(true);
       origSwitch(); // original view-toggle logic
+      checkLeaveNotifications();
     } catch (err) {
       $('login-error').innerText = err.message;
       $('login-error').classList.remove('hidden');
@@ -186,14 +236,56 @@
   window.simulateClockIn = () => punch('/clock-in');
   window.simulateClockOut = () => punch('/clock-out');
 
+  // ---------- Overtime (employee enters the exact timing, e.g. 09:00 PM - 09:30 PM) ----------
+  window.openOvertimeModal = () => {
+    if (currentRole === 'admin') return;
+    const el = $('ot-form-error'); el.innerText = ''; el.classList.add('hidden');
+    setTime12('ot-form-start', '21:00');
+    setTime12('ot-form-end', '21:30');
+    openModal('modal-overtime');
+  };
+
+  window.handleOvertimeSubmit = async e => {
+    e.preventDefault();
+    const errEl = $('ot-form-error');
+    const fail = msg => { errEl.innerText = msg; errEl.classList.remove('hidden'); };
+    errEl.classList.add('hidden');
+    const start = getTime12('ot-form-start'), end = getTime12('ot-form-end');
+    if (end <= start) return fail('End time must be after the start time.');
+    try {
+      await api('/overtime', 'POST', { start, end });
+    } catch (ex) {
+      return fail(ex.message);                         // keep the popup open on error
+    }
+    try { await refresh(); rerender(); } catch {}
+    closeModal('modal-overtime');
+    toast('Overtime recorded', `${fmt12(start)} – ${fmt12(end)} added to today's attendance.`, 'ok');
+  };
+
+  // ---------- Sudden leave (no application: today turns red with status LEAVE) ----------
+  window.markLeaveToday = async () => {
+    if (currentRole === 'admin') return;
+    if (!confirm('Mark yourself on LEAVE for today?\n\nYou will not be able to punch in today.')) return;
+    let err;
+    try { await api('/leave-today', 'POST'); } catch (e) { err = e; }
+    try { await refresh(); rerender(); } catch {}
+    if (err) alert(err.message);
+    else toast('You are on leave today', 'Your status for today is now LEAVE.', 'info');
+  };
+
   window.handleApplyLeaveSubmit = async e => {
     e.preventDefault();
-    await act(() => api('/leaves', 'POST', {
-      type: $('leave-form-type').value, startDate: $('leave-form-start').value,
-      endDate: $('leave-form-end').value, reason: $('leave-form-reason').value
-    }));
+    try {
+      await api('/leaves', 'POST', {
+        type: $('leave-form-type').value, startDate: $('leave-form-start').value,
+        endDate: $('leave-form-end').value, reason: $('leave-form-reason').value.trim()
+      });
+    } catch (ex) {
+      return alert(ex.message);                        // keep the form open on error
+    }
+    try { await refresh(); rerender(); } catch {}
     closeModal('modal-apply-leave');
-    alert('Your leave request has been submitted to the administrator.');
+    toast('Leave request submitted', 'Waiting for the administrator to approve or reject it.', 'info');
   };
 
   // ---------- startup: force admin login first ----------
@@ -202,6 +294,7 @@
     const today = getTodayISO();
     $('filter-log-date').value = today;
     $('payroll-month-select').value = today.substring(0, 7);
+    $('emp-month-select').value = today.substring(0, 7);
     setAppVisible(false);
     await populateRoleDropdown();
     $('portal-role-select').value = 'admin';

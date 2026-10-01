@@ -13,6 +13,8 @@ tailwind.config = { theme: { extend: { fontFamily: { sans: ['Inter', 'sans-serif
 <style>
 @keyframes scanline { 0% { transform: translateY(-100%); } 100% { transform: translateY(100%); } }
 .animate-scan { animation: scanline 2s linear infinite; }
+@keyframes toastin { from { opacity: 0; transform: translateX(30px); } to { opacity: 1; transform: translateX(0); } }
+.toast-in { animation: toastin .25s ease-out; }
 @media print {
   body * { visibility: hidden; }
   #printable-payslip, #printable-payslip * { visibility: visible; }
@@ -29,7 +31,7 @@ tailwind.config = { theme: { extend: { fontFamily: { sans: ['Inter', 'sans-serif
 <div class="bg-blue-600 p-2 rounded-xl text-white shadow-md"><i class="fa-solid me-0 fa-id-card-clip text-xl"></i></div>
 <div>
 <span class="text-xl font-extrabold tracking-tight text-white">VR Studio<span class="text-blue-400">Attendance System</span></span>
-<span class="hidden sm:inline-block text-xs font-semibold uppercase bg-slate-800 text-blue-300 px-2 py-0.5 rounded ml-2 border border-slate-700">Enterprise v3.4</span>
+<span class="hidden sm:inline-block text-xs font-semibold uppercase bg-slate-800 text-blue-300 px-2 py-0.5 rounded ml-2 border border-slate-700">Enterprise v3.6</span>
 </div>
 </div>
 <div class="flex items-center space-x-4">
@@ -85,7 +87,7 @@ tailwind.config = { theme: { extend: { fontFamily: { sans: ['Inter', 'sans-serif
 <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-col justify-between">
 <div class="flex items-center justify-between text-slate-500 text-xs font-semibold uppercase"><span>On Leave</span><i class="fa-solid fa-calendar-minus text-purple-500"></i></div>
 <div id="stat-leave-count" class="text-2xl font-bold text-purple-600 mt-2">0</div>
-<div class="text-[11px] text-purple-600 mt-1">Approved Requests</div>
+<div class="text-[11px] text-purple-600 mt-1">Approved / Sudden Leave</div>
 </div>
 <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-col justify-between">
 <div class="flex items-center justify-between text-slate-500 text-xs font-semibold uppercase"><span>Absent</span><i class="fa-solid fa-user-xmark text-rose-500"></i></div>
@@ -95,7 +97,7 @@ tailwind.config = { theme: { extend: { fontFamily: { sans: ['Inter', 'sans-serif
 <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-col justify-between">
 <div class="flex items-center justify-between text-slate-500 text-xs font-semibold uppercase"><span>Overtime Hrs</span><i class="fa-solid fa-bolt text-indigo-500"></i></div>
 <div id="stat-overtime-hours" class="text-2xl font-bold text-indigo-600 mt-2">0.0h</div>
-<div class="text-[11px] text-indigo-600 mt-1">Current Month</div>
+<div class="text-[11px] text-indigo-600 mt-1">Declared, Current Month</div>
 </div>
 </div>
 
@@ -160,7 +162,7 @@ Today's Live Clock-In Activity Stream
 <table class="w-full text-left border-collapse">
 <thead>
 <tr class="bg-slate-50 border-b border-slate-200 text-xs font-bold text-slate-500 uppercase tracking-wider">
-<th class="py-3.5 px-4">Date</th><th class="py-3.5 px-4">Employee</th><th class="py-3.5 px-4">Clock In</th><th class="py-3.5 px-4">Clock Out</th><th class="py-3.5 px-4">Hours Worked</th><th class="py-3.5 px-4">Overtime</th><th class="py-3.5 px-4">Punches (in order)</th><th class="py-3.5 px-4">Status</th><th class="py-3.5 px-4 text-right">Actions</th>
+<th class="py-3.5 px-4">Date</th><th class="py-3.5 px-4">Employee</th><th class="py-3.5 px-4">Clock In</th><th class="py-3.5 px-4">Clock Out</th><th class="py-3.5 px-4">Hours Worked</th><th class="py-3.5 px-4">Overtime (timing)</th><th class="py-3.5 px-4">Punches (in order)</th><th class="py-3.5 px-4">Status</th><th class="py-3.5 px-4 text-right">Actions</th>
 </tr>
 </thead>
 <tbody id="logs-table-body" class="divide-y divide-slate-100 text-sm"></tbody>
@@ -231,11 +233,14 @@ Today's Live Clock-In Activity Stream
 </div>
 
 <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-<div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 flex flex-col justify-between space-y-6 relative overflow-hidden">
+<div id="kiosk-card" class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 flex flex-col justify-between space-y-6 relative overflow-hidden">
 <div>
 <div class="flex items-center justify-between border-b border-slate-100 pb-3 mb-4">
 <h3 class="font-bold text-slate-800 text-base flex items-center"><i class="fa-solid fa-fingerprint text-blue-600 mr-2"></i> Biometric Kiosk Terminal</h3>
-<span class="text-xs bg-emerald-100 text-emerald-700 font-bold px-2 py-0.5 rounded-full">Kiosk Ready</span>
+<span id="kiosk-ready-badge" class="text-xs bg-emerald-100 text-emerald-700 font-bold px-2 py-0.5 rounded-full">Kiosk Ready</span>
+</div>
+<div id="kiosk-leave-banner" class="hidden mb-4 bg-rose-600 text-white rounded-xl px-4 py-3 text-xs font-bold flex items-center gap-2">
+<i class="fa-solid fa-umbrella-beach text-base"></i><span id="kiosk-leave-text"></span>
 </div>
 <div class="text-center bg-slate-900 text-white rounded-xl p-5 shadow-inner my-2 relative">
 <div id="kiosk-live-time" class="text-3xl font-extrabold font-mono tracking-wider text-blue-400">00:00:00 AM</div>
@@ -250,44 +255,76 @@ Today's Live Clock-In Activity Stream
 </div>
 </div>
 </div>
-<div class="bg-slate-50 p-3 rounded-lg border border-slate-200 text-xs space-y-1.5 mt-4">
+<div id="kiosk-info-box" class="bg-slate-50 border-slate-200 p-3 rounded-lg border text-xs space-y-1.5 mt-4">
 <div class="flex justify-between text-slate-600"><span>My Shift Timing:</span> <span id="kiosk-shift" class="font-bold text-slate-800">--</span></div>
-<div class="flex justify-between text-slate-600"><span>Clock In Status Today:</span> <span id="kiosk-status-badge" class="font-bold text-slate-500">Not Clocked In</span></div>
+<div class="flex justify-between text-slate-600"><span>Status Today:</span> <span id="kiosk-status-badge" class="font-bold text-slate-500">Not Clocked In</span></div>
 <div class="flex justify-between text-slate-600"><span>Punches Today:</span> <span id="kiosk-punch-count" class="font-bold text-slate-800">0</span></div>
 <div class="flex justify-between text-slate-600"><span>Hours Worked Today:</span> <span id="kiosk-hours-today" class="font-bold text-slate-800">0.0 hrs</span></div>
+<div class="flex justify-between text-slate-600 items-start"><span>Overtime Today:</span> <span id="kiosk-ot-today" class="font-bold text-indigo-600 text-right">None</span></div>
 <div class="pt-2 border-t border-slate-200">
 <div class="text-[10px] font-bold uppercase text-slate-400 mb-1">Today's Punches (in order)</div>
 <div id="kiosk-sessions"></div>
 </div>
 </div>
 </div>
-<div class="grid grid-cols-2 gap-3 pt-2">
+<div class="space-y-3 pt-2">
+<div class="grid grid-cols-2 gap-3">
 <button onclick="simulateClockIn()" id="btn-clock-in" class="bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white font-bold py-3 px-4 rounded-xl shadow-md transition flex flex-col items-center justify-center space-y-1"><i class="fa-solid fa-right-to-bracket text-lg"></i><span class="text-xs">PUNCH IN</span></button>
 <button onclick="simulateClockOut()" id="btn-clock-out" class="bg-rose-600 hover:bg-rose-700 active:scale-95 text-white font-bold py-3 px-4 rounded-xl shadow-md transition flex flex-col items-center justify-center space-y-1 opacity-50 cursor-not-allowed" disabled><i class="fa-solid fa-right-from-bracket text-lg"></i><span class="text-xs">PUNCH OUT</span></button>
+</div>
+<div class="grid grid-cols-2 gap-3">
+<button onclick="openOvertimeModal()" id="btn-overtime" title="Add your overtime timing" class="bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white font-bold py-3 px-4 rounded-xl shadow-md transition flex flex-col items-center justify-center space-y-1 opacity-50 cursor-not-allowed" disabled><i class="fa-solid fa-bolt text-lg"></i><span class="text-xs">OVERTIME</span></button>
+<button onclick="markLeaveToday()" id="btn-leave-today" title="Mark yourself on leave for today" class="bg-slate-800 hover:bg-rose-700 active:scale-95 text-white font-bold py-3 px-4 rounded-xl shadow-md transition flex flex-col items-center justify-center space-y-1"><i class="fa-solid fa-umbrella-beach text-lg"></i><span class="text-xs">LEAVE TODAY</span></button>
+</div>
+<p class="text-[10px] text-slate-400 text-center">Overtime counts only when you add its timing. Leave Today needs no application.</p>
 </div>
 </div>
 
 <div class="lg:col-span-2 space-y-6">
 <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 flex items-center justify-between">
 <div>
-<h4 class="font-bold text-slate-800 text-sm">Need Time Off?</h4>
+<h4 class="font-bold text-slate-800 text-sm">Need Time Off in Advance?</h4>
 <p class="text-xs text-slate-500">Submit an official leave request for administrator review.</p>
 </div>
 <button onclick="openApplyLeaveModal()" class="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-4 py-2.5 rounded-xl shadow-sm transition flex items-center space-x-2"><i class="fa-solid fa-plus"></i><span>Apply for Leave</span></button>
 </div>
+
+<div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+<div class="p-4 border-b border-slate-100 flex flex-wrap gap-3 justify-between items-center bg-slate-50">
+<h3 class="font-bold text-slate-800 text-sm flex items-center"><i class="fa-solid fa-history mr-2 text-slate-500"></i> Personal Attendance & Payslip History</h3>
+<div class="flex items-center space-x-2">
+<label for="emp-month-select" class="text-[11px] font-bold text-slate-500 uppercase">Month:</label>
+<input type="month" id="emp-month-select" onchange="renderEmployeePortal(currentRole)" class="border border-slate-300 rounded-lg text-xs px-2.5 py-1 focus:ring-2 focus:ring-blue-500 font-medium">
+</div>
+</div>
+<div class="grid grid-cols-2 gap-3 p-4 border-b border-slate-100">
+<div class="rounded-xl border border-emerald-200 bg-emerald-50 p-3"><div class="text-[11px] font-semibold text-emerald-700">Present</div><div id="emp-sum-present" class="text-2xl font-extrabold text-emerald-700">0</div><div class="text-[10px] text-emerald-600">days &bull; <span id="emp-sum-late" class="font-bold text-amber-600">0</span> late</div></div>
+<div class="rounded-xl border border-rose-200 bg-rose-50 p-3"><div class="text-[11px] font-semibold text-rose-700">Absent &amp; Leave</div><div id="emp-sum-away" class="text-2xl font-extrabold text-rose-700">0</div><div class="text-[10px] text-rose-600">days &bull; <span id="emp-sum-absent" class="font-bold">0</span> absent &bull; <span id="emp-sum-leave" class="font-bold">0</span> leave</div></div>
+</div>
+<div class="overflow-x-auto max-h-[420px] overflow-y-auto">
+<table class="w-full text-left border-collapse">
+<thead>
+<tr class="bg-slate-50 border-b border-slate-200 text-[11px] font-bold text-slate-500 uppercase tracking-wider sticky top-0">
+<th class="py-3 px-4">Date</th><th class="py-3 px-4">Status</th><th class="py-3 px-4">Overtime (timing)</th>
+</tr>
+</thead>
+<tbody id="emp-personal-logs-body" class="divide-y divide-slate-100 text-xs"></tbody>
+</table>
+</div>
+</div>
+
 <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
 <div class="p-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
-<h3 class="font-bold text-slate-800 text-sm flex items-center"><i class="fa-solid fa-history mr-2 text-slate-500"></i> Personal Attendance & Payslip History</h3>
-<button onclick="viewCurrentEmpPayslip()" class="text-xs font-bold text-blue-600 hover:underline flex items-center"><i class="fa-solid fa-receipt mr-1"></i> View Current Month Payslip</button>
+<h3 class="font-bold text-slate-800 text-sm flex items-center"><i class="fa-solid fa-calendar-check mr-2 text-slate-500"></i> My Leave Requests</h3>
 </div>
 <div class="overflow-x-auto">
 <table class="w-full text-left border-collapse">
 <thead>
 <tr class="bg-slate-50 border-b border-slate-200 text-[11px] font-bold text-slate-500 uppercase tracking-wider">
-<th class="py-3 px-4">Date</th><th class="py-3 px-4">Clock In</th><th class="py-3 px-4">Clock Out</th><th class="py-3 px-4">Hours</th><th class="py-3 px-4">Overtime</th><th class="py-3 px-4">Punches (in order)</th><th class="py-3 px-4">Status</th>
+<th class="py-3 px-4">Type</th><th class="py-3 px-4">Dates</th><th class="py-3 px-4">Reason</th><th class="py-3 px-4">Status</th>
 </tr>
 </thead>
-<tbody id="emp-personal-logs-body" class="divide-y divide-slate-100 text-xs"></tbody>
+<tbody id="emp-my-leaves-body" class="divide-y divide-slate-100 text-xs"></tbody>
 </table>
 </div>
 </div>
@@ -393,6 +430,28 @@ Today's Live Clock-In Activity Stream
 </div>
 </div>
 
+<!-- Overtime: employee enters the exact timing, e.g. 09:00 PM - 09:30 PM -->
+<div id="modal-overtime" class="fixed inset-0 bg-slate-900/60 backdrop-blur-xs hidden z-50 flex items-center justify-center p-4">
+<div class="bg-white rounded-2xl shadow-xl border border-slate-200 max-w-md w-full overflow-hidden">
+<div class="bg-slate-900 px-6 py-4 text-white flex justify-between items-center">
+<h3 class="font-bold text-base flex items-center"><i class="fa-solid fa-bolt text-indigo-400 mr-2"></i> Add Overtime</h3>
+<button type="button" onclick="closeModal('modal-overtime')" class="text-slate-400 hover:text-white text-lg"><i class="fa-solid fa-xmark"></i></button>
+</div>
+<form id="form-overtime" onsubmit="handleOvertimeSubmit(event)" class="p-6 space-y-4" novalidate>
+<p class="text-xs text-slate-500">Enter the exact time you worked extra today. Only this timing is counted as overtime (paid at 1.5x).</p>
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+<div><label class="block text-xs font-bold text-slate-700 uppercase mb-1">Overtime From</label><div id="ot-form-start"></div></div>
+<div><label class="block text-xs font-bold text-slate-700 uppercase mb-1">Overtime To</label><div id="ot-form-end"></div></div>
+</div>
+<p id="ot-form-error" class="text-xs text-rose-600 font-semibold hidden"></p>
+<div class="pt-2 flex justify-end space-x-3">
+<button type="button" onclick="closeModal('modal-overtime')" class="px-4 py-2 rounded-lg text-sm font-semibold text-slate-600 hover:bg-slate-100">Cancel</button>
+<button type="submit" class="px-5 py-2 rounded-lg text-sm font-semibold bg-indigo-600 text-white hover:bg-indigo-700 shadow-sm">Save Overtime</button>
+</div>
+</form>
+</div>
+</div>
+
 <div id="modal-payslip" class="fixed inset-0 bg-slate-900/60 backdrop-blur-xs hidden z-50 flex items-center justify-center p-4">
 <div class="bg-white rounded-2xl shadow-xl border border-slate-200 max-w-2xl w-full overflow-hidden my-6">
 <div class="bg-slate-900 px-6 py-4 text-white flex justify-between items-center print:hidden">
@@ -464,6 +523,21 @@ let currentRole = 'admin';
 const APP_TZ = 'Asia/Kolkata';
 const getTodayISO = () => new Date().toLocaleDateString('en-CA', { timeZone: APP_TZ });
 
+// Weekly off days for the employee history (0=Sun, 1=Mon ... 6=Sat). [] = every day counts.
+// Example: const WEEKLY_OFF = [0];  -> Sundays are shown as "WEEKLY OFF" instead of "ABSENT"
+const WEEKLY_OFF = [];
+const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+// ===== Date helpers (pure string maths, no timezone surprises) =====
+const addDays = (iso, n) => {
+  const [y, m, d] = iso.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
+};
+const weekdayOf = iso => {
+  const [y, m, d] = iso.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+};
+
 // ===== 12-hour time helpers (DB stores "HH:MM" 24h, UI always shows 12h) =====
 const pad2 = n => String(n).padStart(2, '0');
 function fmt12(t) {
@@ -520,6 +594,13 @@ function punchListHTML(log) {
     </li>`).join('')}</ol>`;
 }
 
+// ===== Overtime display: "09:00 PM – 09:30 PM" for each declared slot =====
+function overtimeSlotsHTML(log, emptyText) {
+  const slots = (log && log.overtimeSlots) || [];
+  if (!slots.length) return `<span class="text-slate-300">${emptyText || '-'}</span>`;
+  return slots.map(s => `<div class="font-mono text-[11px] text-indigo-700 font-semibold whitespace-nowrap">${fmt12(s.start)} – ${fmt12(s.end)}</div>`).join('');
+}
+
 // ===== Live clocks (always in APP_TZ so they match the punch times) =====
 function setupLiveClocks() {
   function tick() {
@@ -567,8 +648,10 @@ function renderAdminDashboard() {
   const today = getTodayISO();
   const totalStaff = db.employees.length;
   const todayLogs = db.attendanceLogs.filter(l => l.date === today);
-  const presentCount = todayLogs.filter(l => l.status === 'PRESENT' || l.status === 'LATE').length;
-  const lateCount = todayLogs.filter(l => l.status === 'LATE').length;
+  // Only people who actually punched in (sudden-leave rows are not "present")
+  const presentLogs = todayLogs.filter(l => l.status === 'PRESENT' || l.status === 'LATE');
+  const presentCount = presentLogs.length;
+  const lateCount = presentLogs.filter(l => l.status === 'LATE').length;
   const leaveCount = db.leaveRequests.filter(r => r.status === 'APPROVED' && r.startDate <= today && r.endDate >= today).length;
   const absentCount = Math.max(0, totalStaff - presentCount - leaveCount);
   const month = today.substring(0, 7);
@@ -584,9 +667,9 @@ function renderAdminDashboard() {
   document.getElementById('stat-overtime-hours').innerText = `${totalOT.toFixed(1)}h`;
 
   const stream = document.getElementById('dashboard-live-stream');
-  stream.innerHTML = todayLogs.length === 0
+  stream.innerHTML = presentLogs.length === 0
     ? `<div class="text-center text-slate-400 py-8 text-xs">No clock-in activity recorded yet for today (${today}).</div>`
-    : todayLogs.map(log => {
+    : presentLogs.map(log => {
         const emp = db.employees.find(e => e.id === log.empId) || { name: log.empId, role: 'Staff' };
         const color = log.status === 'LATE' ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-800';
         return `<div class="flex items-center justify-between p-3 bg-slate-50 rounded-xl border border-slate-100">
@@ -602,7 +685,7 @@ function renderAdminDashboard() {
   const depts = [...new Set(db.employees.map(e => e.dept))];
   document.getElementById('department-summary-list').innerHTML = depts.map(d => {
     const staff = db.employees.filter(e => e.dept === d);
-    const present = todayLogs.filter(l => staff.some(e => e.id === l.empId)).length;
+    const present = presentLogs.filter(l => staff.some(e => e.id === l.empId)).length;
     const pct = Math.round((present / staff.length) * 100);
     return `<div><div class="flex justify-between text-xs font-semibold text-slate-700 mb-1"><span>${d}</span><span>${present}/${staff.length} (${pct}%)</span></div>
       <div class="w-full bg-slate-100 rounded-full h-2 overflow-hidden"><div class="bg-blue-600 h-2 rounded-full" style="width:${pct}%"></div></div></div>`;
@@ -667,28 +750,52 @@ function editEmployee(id) {
   openModal('modal-employee');
 }
 
-// ===== Attendance logs =====
+// ===== Attendance logs (admin) =====
+// Approved leave days (applied OR sudden) that have no real attendance row yet -> shown as ON_LEAVE rows
+function leaveDayRows(dateFilter) {
+  const today = getTodayISO();
+  const rows = [];
+  db.leaveRequests.filter(r => r.status === 'APPROVED').forEach(r => {
+    const days = dateFilter ? [dateFilter] : [];
+    if (!dateFilter) {
+      const end = r.endDate < today ? r.endDate : today;          // no filter: up to today only
+      for (let d = r.startDate, n = 0; d <= end && n < 366; d = addDays(d, 1), n++) days.push(d);
+    }
+    days.filter(d => d >= r.startDate && d <= r.endDate).forEach(d => {
+      if (db.attendanceLogs.some(l => l.empId === r.empId && l.date === d)) return;   // real log wins
+      rows.push({ id: `LEAVE-${r.id}-${d}`, virtual: true, leave: r, empId: r.empId, date: d,
+        clockIn: null, clockOut: null, hoursWorked: 0, overtimeHours: 0, status: 'ON_LEAVE', punches: 0, sessions: [], overtimeSlots: [] });
+    });
+  });
+  return rows;
+}
+
 function renderAttendanceLogs() {
   const d = document.getElementById('filter-log-date').value;
   const st = document.getElementById('filter-log-status').value;
   const tbody = document.getElementById('logs-table-body');
-  let logs = [...db.attendanceLogs];
+  let logs = [...db.attendanceLogs, ...leaveDayRows(d)];
   if (d) logs = logs.filter(l => l.date === d);
   if (st && st !== 'ALL') logs = logs.filter(l => l.status === st);
+  logs.sort((x, y) => (x.date < y.date ? 1 : x.date > y.date ? -1 : 0));   // newest first
   if (!logs.length) { tbody.innerHTML = `<tr><td colspan="9" class="p-6 text-center text-slate-400 text-xs">No attendance logs found matching filters.</td></tr>`; return; }
   const badges = { PRESENT: 'bg-emerald-100 text-emerald-800', LATE: 'bg-amber-100 text-amber-800', ABSENT: 'bg-rose-100 text-rose-800', ON_LEAVE: 'bg-purple-100 text-purple-800' };
   tbody.innerHTML = logs.map(log => {
     const emp = db.employees.find(e => e.id === log.empId) || { name: log.empId };
-    return `<tr class="hover:bg-slate-50 align-top">
+    const leaveNote = log.virtual ? `<div class="text-[10px] text-purple-700 font-semibold mt-1">${log.leave.type}</div>` : '';
+    const action = log.virtual
+      ? `<span class="text-[10px] text-slate-400">via Leave Hub</span>`
+      : `<button onclick="deleteLog('${log.id}')" class="text-rose-600 hover:text-rose-800 text-xs"><i class="fa-solid fa-trash"></i></button>`;
+    return `<tr class="hover:bg-slate-50 align-top ${log.status === 'ON_LEAVE' ? 'bg-purple-50/40' : ''}">
       <td class="py-3 px-4 font-mono text-xs text-slate-600">${log.date}</td>
       <td class="py-3 px-4"><div class="font-bold text-slate-800">${emp.name}</div><div class="text-xs text-slate-400 font-mono">${log.empId}</div>${emp.workStart ? `<div class="text-[10px] text-slate-400">Shift ${fmtShift(emp)}</div>` : ''}</td>
       <td class="py-3 px-4 font-mono text-xs text-slate-700 whitespace-nowrap">${fmt12(log.clockIn)}</td>
       <td class="py-3 px-4 font-mono text-xs text-slate-700 whitespace-nowrap">${fmt12(log.clockOut)}</td>
       <td class="py-3 px-4 font-mono text-xs text-slate-800 font-bold">${(log.hoursWorked || 0).toFixed(1)} hrs</td>
-      <td class="py-3 px-4 font-mono text-xs text-indigo-600 font-bold">${(log.overtimeHours || 0).toFixed(1)} hrs</td>
+      <td class="py-3 px-4 text-xs"><div class="font-mono text-indigo-600 font-bold mb-1">${(log.overtimeHours || 0).toFixed(1)} hrs</div>${overtimeSlotsHTML(log, 'None')}</td>
       <td class="py-3 px-4 text-xs"><div class="font-bold text-slate-800 mb-1">${punchLabel(log.punches)}</div>${punchListHTML(log)}</td>
-      <td class="py-3 px-4"><span class="px-2.5 py-1 text-[11px] rounded-md font-bold ${badges[log.status] || 'bg-slate-100 text-slate-700'}">${log.status}</span></td>
-      <td class="py-3 px-4 text-right"><button onclick="deleteLog('${log.id}')" class="text-rose-600 hover:text-rose-800 text-xs"><i class="fa-solid fa-trash"></i></button></td>
+      <td class="py-3 px-4"><span class="px-2.5 py-1 text-[11px] rounded-md font-bold ${badges[log.status] || 'bg-slate-100 text-slate-700'}">${log.status}</span>${leaveNote}</td>
+      <td class="py-3 px-4 text-right">${action}</td>
     </tr>`;
   }).join('');
 }
@@ -707,7 +814,7 @@ function openManualLogModal() {
   openModal('modal-manual-log');
 }
 
-// ===== Leaves =====
+// ===== Leaves (admin) =====
 function renderLeaveRequests() {
   const tbody = document.getElementById('leaves-table-body');
   if (!db.leaveRequests.length) { tbody.innerHTML = `<tr><td colspan="6" class="p-6 text-center text-slate-400 text-xs">No leave applications recorded.</td></tr>`; return; }
@@ -729,11 +836,11 @@ function renderLeaveRequests() {
 }
 
 // ===== Payroll =====
-// Regular hours = worked - overtime (overtime is beyond each employee's own shift length)
+// Regular hours = punched hours. Overtime = ONLY the timing the employee declared (paid at 1.5x).
 function calcPay(emp, month) {
   const logs = db.attendanceLogs.filter(l => l.empId === emp.id && l.date.startsWith(month));
   const ot = logs.reduce((a, c) => a + (c.overtimeHours || 0), 0);
-  const reg = logs.reduce((a, c) => a + Math.max(0, (c.hoursWorked || 0) - (c.overtimeHours || 0)), 0);
+  const reg = logs.reduce((a, c) => a + (c.hoursWorked || 0), 0);
   const base = reg * emp.hourlyRate, otPay = ot * emp.hourlyRate * 1.5;
   const gross = base + otPay, ded = gross * 0.15;
   return { reg, ot, base, otPay, gross, ded, net: gross - ded };
@@ -787,20 +894,101 @@ function openPayslipModal(empId, month) {
   openModal('modal-payslip');
 }
 
+// ===== Employee history: one row per day of the chosen month (PRESENT / LATE / ABSENT / LEAVE) =====
+function buildEmployeeHistory(emp, month) {
+  const today = getTodayISO();
+  const logs = db.attendanceLogs.filter(l => l.empId === emp.id);
+  const leaves = db.leaveRequests.filter(r => r.empId === emp.id && r.status === 'APPROVED');
+
+  // Days before the employee joined (or their first log) are not counted as absent
+  let joined = emp.joined || today;
+  logs.forEach(l => { if (l.date < joined) joined = l.date; });
+
+  const [y, m] = month.split('-').map(Number);
+  const monthStart = `${month}-01`;
+  const monthEnd = `${month}-${pad2(new Date(Date.UTC(y, m, 0)).getUTCDate())}`;
+  const last = monthEnd > today ? today : monthEnd;      // never look into the future
+  const first = joined > monthStart ? joined : monthStart;
+
+  const rows = [];
+  for (let d = last; d >= first; d = addDays(d, -1)) {
+    const log = logs.find(l => l.date === d);
+    const leave = leaves.find(r => r.startDate <= d && r.endDate >= d);
+    let status;
+    if (log) status = log.status === 'ON_LEAVE' ? 'LEAVE' : log.status;   // PRESENT / LATE / ABSENT / LEAVE
+    else if (leave) status = 'LEAVE';
+    else if (WEEKLY_OFF.includes(weekdayOf(d))) status = 'OFF';
+    else if (d === today) status = 'PENDING';
+    else status = 'ABSENT';
+    rows.push({ date: d, status, log, leave });
+  }
+  return rows;
+}
+
+function renderEmployeeHistory(emp) {
+  const month = document.getElementById('emp-month-select').value || getTodayISO().substring(0, 7);
+  const rows = buildEmployeeHistory(emp, month);
+
+  // Month totals
+  const c = { PRESENT: 0, LATE: 0, ABSENT: 0, LEAVE: 0 };
+  rows.forEach(r => { if (c[r.status] !== undefined) c[r.status]++; });
+  document.getElementById('emp-sum-present').innerText = c.PRESENT + c.LATE;   // late days are present days too
+  document.getElementById('emp-sum-late').innerText = c.LATE;
+  document.getElementById('emp-sum-absent').innerText = c.ABSENT;
+  document.getElementById('emp-sum-leave').innerText = c.LEAVE;
+  document.getElementById('emp-sum-away').innerText = c.ABSENT + c.LEAVE;
+
+  const tbody = document.getElementById('emp-personal-logs-body');
+  if (!rows.length) { tbody.innerHTML = `<tr><td colspan="3" class="p-4 text-center text-slate-400">No attendance days in this month yet.</td></tr>`; return; }
+
+  const badgeCls = {
+    PRESENT: 'bg-emerald-100 text-emerald-800', LATE: 'bg-amber-100 text-amber-800',
+    ABSENT: 'bg-rose-100 text-rose-800', LEAVE: 'bg-rose-600 text-white',
+    OFF: 'bg-slate-100 text-slate-600', PENDING: 'bg-slate-100 text-slate-600'
+  };
+  const badgeTxt = { OFF: 'WEEKLY OFF', PENDING: 'NOT PUNCHED YET' };
+  tbody.innerHTML = rows.map(r => `
+    <tr class="align-top ${r.status === 'LEAVE' ? 'bg-rose-50' : 'hover:bg-slate-50'}">
+      <td class="py-2.5 px-4"><span class="font-mono font-medium">${r.date}</span> <span class="text-[10px] text-slate-400">${DAY_NAMES[weekdayOf(r.date)]}</span></td>
+      <td class="py-2.5 px-4"><span class="px-2 py-0.5 text-[10px] rounded font-bold ${badgeCls[r.status]}">${badgeTxt[r.status] || r.status}</span>${r.status === 'LEAVE' && r.leave ? `<span class="ml-2 text-[10px] text-rose-700 font-semibold">${r.leave.type}</span>` : ''}</td>
+      <td class="py-2.5 px-4">${overtimeSlotsHTML(r.log, '-')}</td>
+    </tr>`).join('');
+}
+
 // ===== Employee portal =====
 function renderEmployeePortal(empId) {
   const emp = db.employees.find(e => e.id === empId); if (!emp) return;
   const set = (id, v) => document.getElementById(id).innerText = v;
+  const todayISO = getTodayISO();
   set('emp-portal-name', emp.name);
   set('emp-portal-role', `${emp.role} • ${emp.dept}`);
   set('emp-portal-id', `ID: ${emp.id}`);
   set('emp-portal-avatar', emp.name.split(' ').map(n => n[0]).join(''));
   set('kiosk-shift', fmtShift(emp));
 
-  const log = db.attendanceLogs.find(l => l.empId === empId && l.date === getTodayISO());
+  const log = db.attendanceLogs.find(l => l.empId === empId && l.date === todayISO);
   const bIn = document.getElementById('btn-clock-in'), bOut = document.getElementById('btn-clock-out');
+  const bOT = document.getElementById('btn-overtime'), bLeave = document.getElementById('btn-leave-today');
   const badge = document.getElementById('kiosk-status-badge');
   const toggle = (b, on) => { b.disabled = !on; b.classList.toggle('opacity-50', !on); b.classList.toggle('cursor-not-allowed', !on); };
+
+  // Leave covering today (approved request OR sudden leave)?
+  const leaveToday = db.leaveRequests.find(r => r.empId === empId && r.status === 'APPROVED' && r.startDate <= todayISO && r.endDate >= todayISO);
+
+  // Red box when on leave
+  const card = document.getElementById('kiosk-card');
+  const info = document.getElementById('kiosk-info-box');
+  const cardOn = ['border-rose-500', 'bg-rose-50', 'ring-2', 'ring-rose-300'], cardOff = ['border-slate-200', 'bg-white'];
+  const infoOn = ['bg-rose-100', 'border-rose-400'], infoOff = ['bg-slate-50', 'border-slate-200'];
+  card.classList.remove(...(leaveToday ? cardOff : cardOn)); card.classList.add(...(leaveToday ? cardOn : cardOff));
+  info.classList.remove(...(leaveToday ? infoOff : infoOn)); info.classList.add(...(leaveToday ? infoOn : infoOff));
+  document.getElementById('kiosk-leave-banner').classList.toggle('hidden', !leaveToday);
+  if (leaveToday) set('kiosk-leave-text', `LEAVE TODAY — ${leaveToday.type} (${leaveToday.startDate} to ${leaveToday.endDate})`);
+  const ready = document.getElementById('kiosk-ready-badge');
+  ready.innerText = leaveToday ? 'LEAVE' : 'Kiosk Ready';
+  ready.className = leaveToday
+    ? 'text-xs bg-rose-600 text-white font-bold px-2 py-0.5 rounded-full'
+    : 'text-xs bg-emerald-100 text-emerald-700 font-bold px-2 py-0.5 rounded-full';
 
   const sess = log ? (log.sessions || []) : [];
   const last = sess[sess.length - 1];
@@ -811,10 +999,19 @@ function renderEmployeePortal(empId) {
   set('kiosk-hours-today', `${(log ? log.hoursWorked || 0 : 0).toFixed(1)} hrs`);
   document.getElementById('kiosk-sessions').innerHTML = punchListHTML(log);
 
+  // Overtime declared today
+  const otSlots = log ? (log.overtimeSlots || []) : [];
+  document.getElementById('kiosk-ot-today').innerHTML = otSlots.length
+    ? otSlots.map(s => `<div class="font-mono">${fmt12(s.start)} – ${fmt12(s.end)}</div>`).join('') + `<div class="text-[10px] text-slate-500 font-semibold">${(log.overtimeHours || 0).toFixed(1)} hrs total</div>`
+    : 'None';
+
   if (openSess) {
-    const when = openLog.date === getTodayISO() ? fmt12(openSess.in) : `${fmt12(openSess.in)} on ${openLog.date}`;
+    const when = openLog.date === todayISO ? fmt12(openSess.in) : `${fmt12(openSess.in)} on ${openLog.date}`;
     badge.innerText = `Clocked In at ${when}`; badge.className = 'font-bold text-emerald-600';
     toggle(bIn, false); toggle(bOut, true);
+  } else if (leaveToday) {
+    badge.innerText = 'LEAVE'; badge.className = 'font-bold text-rose-700';
+    toggle(bIn, false); toggle(bOut, false);
   } else if (last) {
     badge.innerText = `On Break (last out ${fmt12(last.out)})`; badge.className = 'font-bold text-blue-600';
     toggle(bIn, true); toggle(bOut, false);
@@ -823,17 +1020,24 @@ function renderEmployeePortal(empId) {
     toggle(bIn, true); toggle(bOut, false);
   }
 
-  const mine = db.attendanceLogs.filter(l => l.empId === empId);
-  document.getElementById('emp-personal-logs-body').innerHTML = mine.length === 0
-    ? `<tr><td colspan="7" class="p-4 text-center text-slate-400">No personal attendance records.</td></tr>`
-    : mine.map(l => `<tr class="hover:bg-slate-50 align-top">
-        <td class="py-2.5 px-4 font-mono font-medium">${l.date}</td>
-        <td class="py-2.5 px-4 font-mono text-slate-600 whitespace-nowrap">${fmt12(l.clockIn)}</td>
-        <td class="py-2.5 px-4 font-mono text-slate-600 whitespace-nowrap">${fmt12(l.clockOut)}</td>
-        <td class="py-2.5 px-4 font-mono font-bold">${l.hoursWorked ? l.hoursWorked.toFixed(1) + ' hrs' : '-'}</td>
-        <td class="py-2.5 px-4 font-mono text-indigo-600">${l.overtimeHours ? l.overtimeHours.toFixed(1) + ' hrs' : '-'}</td>
-        <td class="py-2.5 px-4"><div class="font-bold text-slate-800 mb-1">${punchLabel(l.punches)}</div>${punchListHTML(l)}</td>
-        <td class="py-2.5 px-4"><span class="px-2 py-0.5 text-[10px] rounded font-bold ${l.status === 'LATE' ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-800'}">${l.status}</span></td>
+  // Overtime needs a day with punches and no leave. Leave Today needs a day with no punches and no leave.
+  const hasPunchesToday = sess.length > 0;
+  toggle(bOT, hasPunchesToday && !leaveToday);
+  toggle(bLeave, !hasPunchesToday && !leaveToday && !openSess);
+
+  // Month history + totals (present / late / absent / leave)
+  renderEmployeeHistory(emp);
+
+  // My leave requests
+  const lb = { PENDING: 'bg-amber-100 text-amber-800', APPROVED: 'bg-emerald-100 text-emerald-800', REJECTED: 'bg-rose-100 text-rose-800' };
+  const mine = db.leaveRequests.filter(r => r.empId === empId);
+  document.getElementById('emp-my-leaves-body').innerHTML = mine.length === 0
+    ? `<tr><td colspan="4" class="p-4 text-center text-slate-400">You have not applied for any leave.</td></tr>`
+    : mine.map(r => `<tr class="hover:bg-slate-50">
+        <td class="py-2.5 px-4 font-medium">${r.type}</td>
+        <td class="py-2.5 px-4 font-mono">${r.startDate} to ${r.endDate}</td>
+        <td class="py-2.5 px-4 text-slate-600 max-w-[200px] truncate">${r.reason}</td>
+        <td class="py-2.5 px-4"><span class="px-2 py-0.5 text-[10px] rounded font-bold ${lb[r.status] || ''}">${r.status}</span></td>
       </tr>`).join('');
 }
 
@@ -842,10 +1046,6 @@ function openApplyLeaveModal() {
   document.getElementById('leave-form-start').value = getTodayISO();
   document.getElementById('leave-form-end').value = getTodayISO();
   openModal('modal-apply-leave');
-}
-
-function viewCurrentEmpPayslip() {
-  if (currentRole !== 'admin') openPayslipModal(currentRole, getTodayISO().substring(0, 7));
 }
 
 // ===== Modal helpers =====
@@ -857,9 +1057,11 @@ buildTime12('emp-form-start', '09:00');
 buildTime12('emp-form-end', '17:00');
 buildTime12('manual-log-in', '09:00');
 buildTime12('manual-log-out', '17:00');
+buildTime12('ot-form-start', '21:00');
+buildTime12('ot-form-end', '21:30');
 </script>
 
-<!-- Backend glue: login, API calls, realtime. MUST stay last. -->
+<!-- Backend glue: login, API calls, realtime, notifications. MUST stay last. -->
 <script src="backend.js"></script>
 </body>
 </html>
