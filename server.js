@@ -1,6 +1,6 @@
+require('dotenv').config(); // loads MONGODB_URI, JWT_SECRET etc. from the .env file (local use)
 const express = require('express');
-const { initializeApp, cert } = require('firebase-admin/app');
-const { getDatabase } = require('firebase-admin/database');
+const { MongoClient } = require('mongodb');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
@@ -16,46 +16,34 @@ const LUNCH_ALLOWED_MIN = 60;
 const TZ = process.env.APP_TZ || 'Asia/Kolkata';
 const PORT = process.env.PORT || 3000;
 
-// ---------- FIREBASE REALTIME DATABASE ----------
-const DB_URL = process.env.FIREBASE_DB_URL || 'https://attendance-system-bc0dd-default-rtdb.firebaseio.com';
-function loadServiceAccount() {
-  const raw = (process.env.FIREBASE_SERVICE_ACCOUNT || '').trim();
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw.startsWith('{') ? raw : Buffer.from(raw, 'base64').toString('utf8'));
-  } catch (e) {
-    console.error('FIREBASE_SERVICE_ACCOUNT is not valid JSON (or base64 JSON):', e.message);
-    return null;
-  }
-}
-const serviceAccount = loadServiceAccount();
-if (!serviceAccount) {
-  console.error('Missing FIREBASE_SERVICE_ACCOUNT. Firebase console > Project settings > Service accounts > Generate new private key, then paste the whole JSON into this environment variable.');
+// ---------- MONGODB ----------
+const MONGODB_URI = (process.env.MONGODB_URI || '').trim();
+const MONGODB_DB = process.env.MONGODB_DB || 'attendance';
+if (!MONGODB_URI) {
+  console.error('Missing MONGODB_URI. Put your MongoDB connection string in the .env file (or the host\'s environment variables).');
   process.exit(1);
 }
-initializeApp({ credential: cert(serviceAccount), databaseURL: DB_URL });
-const rdb = getDatabase();
+const client = new MongoClient(MONGODB_URI);
+let mdb;
+const col = name => mdb.collection(name);
 
-const get = async p => (await rdb.ref(p).get()).val();
-const set = (p, v) => rdb.ref(p).set(v);
-const update = (p, v) => rdb.ref(p).update(v);
-const remove = p => rdb.ref(p).remove();
-const push = async (p, v) => { const r = rdb.ref(p).push(); await r.set(v); return r.key; };
+// ---------- DATA LAYOUT (one collection per kind, _id = string) ----------
+// admins      { _id: username, username, passwordHash }
+// employees   { _id: empId, name, passwordHash, dept, role, hourlyRate, workStart, workEnd, joined }
+// attendance  { _id: 'empId__date', empId, date, clockIn, clockOut, hours, ot, status, punches, ... }
+// punches     { _id, empId, date, in, out }
+// overtime    { _id, empId, date, start, end }
+// breaks      { _id, empId, date, kind, start, end }   (start/end are epoch ms)
+// leaves      { _id, empId, type, startDate, endDate, reason, status, seen, seq }
 
-// Wrap async routes so errors go to the error handler instead of hanging
-const h = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
-
-// ---------- DATA LAYOUT ----------
-// admins/{key}                    { username, passwordHash }
-// employees/{empId}               { name, passwordHash, dept, role, hourlyRate, workStart, workEnd, joined }
-// attendance/{empId}/{date}       daily summary row
-// punches/{empId}/{date}/{id}     { in, out }
-// overtime/{empId}/{date}/{id}    { start, end }
-// breaks/{empId}/{date}/{id}      { kind, start, end }   (start/end are epoch ms)
-// leaves/{id}                     { empId, type, startDate, endDate, reason, status, seen, seq }
-
-const encKey = s => encodeURIComponent(String(s)).replace(/\./g, '%2E');
 const okKey = s => /^[A-Za-z0-9_-]+$/.test(s);
+
+// documents come back as {key, ...fields} (key = _id) so the rest of the code stays simple
+const withKey = d => { const { _id, ...r } = d; return { key: _id, ...r }; };
+const list = async (name, filter = {}) => (await col(name).find(filter).toArray()).map(withKey);
+const dayList = (kind, empId, date) => list(kind, { empId, date });
+const newId = prefix => prefix + Date.now() + '-' + crypto.randomBytes(3).toString('hex');
+const insert = async (name, doc, prefix) => { const _id = newId(prefix); await col(name).insertOne({ _id, ...doc }); return _id; };
 
 const tzParts = () => {
   const p = {};
@@ -68,19 +56,22 @@ const tzParts = () => {
 const today = () => { const p = tzParts(); return `${p.year}-${p.month}-${p.day}`; };
 const nowHM = () => { const p = tzParts(); return `${p.hour}:${p.minute}`; };
 
+// Wrap async routes so errors go to the error handler instead of hanging
+const h = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
 const app = express();
 app.use(express.json());
 app.use(express.static('public', { etag: false, setHeaders: res => res.set('Cache-Control', 'no-store') }));
 
-// Reject ids with characters Firebase does not allow in keys
+// Reject ids with unexpected characters
 app.param('id', (req, res, next, v) => okKey(v) ? next() : res.status(400).json({ error: 'Bad id' }));
 
 const mins = t => { const [hh, m] = t.split(':'); return hh * 60 + +m; };
 const hoursBetween = (i, o) => { let x = (mins(o) - mins(i)) / 60; if (x < 0) x += 24; return x; };
 const overlap = (a1, a2, b1, b2) => Math.max(0, Math.min(a2, b2) - Math.max(a1, b1));
-const newId = prefix => prefix + Date.now() + '-' + crypto.randomBytes(3).toString('hex');
-const validTime = t => /^([01]\d|2[0-3]):[0-5]\d$/.test(t || '');
-const validDate = d => /^\d{4}-\d{2}-\d{2}$/.test(d || '');
+const validTime = t => typeof t === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(t);
+const validDate = d => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d);
+const byIn = (x, y) => (x.in < y.in ? -1 : x.in > y.in ? 1 : x.key < y.key ? -1 : 1);
 
 // Minutes of [a,b] (24h minutes) that fall inside the shift [ws,we] (handles overnight shifts)
 function shiftOverlapMin(a, b, ws, we) {
@@ -89,18 +80,6 @@ function shiftOverlapMin(a, b, ws, we) {
   if (b < a) b += 1440;
   return overlap(a, b, s, e) + overlap(a + 1440, b + 1440, s, e);
 }
-
-// {key: value} -> [{key, ...value}]
-const toList = o => o ? Object.entries(o).map(([key, v]) => ({ key, ...v })) : [];
-// emp/date/key tree -> flat list with empId + date
-const flatTree = tree => {
-  const out = [];
-  Object.entries(tree || {}).forEach(([empId, days]) =>
-    Object.entries(days || {}).forEach(([date, items]) =>
-      Object.entries(items || {}).forEach(([key, v]) => out.push({ empId, date, key, ...v }))));
-  return out;
-};
-const dayList = async (kind, empId, date) => toList(await get(`${kind}/${empId}/${date}`));
 
 // Row -> shape the frontend understands (times are stored/sent as 24h "HH:MM", the UI shows 12h)
 const E = (id, r) => ({
@@ -130,23 +109,26 @@ const empOnly = (req, res, next) => req.user.role === 'employee' ? next() : res.
 
 app.post('/api/login', h(async (req, res) => {
   const { as, username, password } = req.body || {};
+  const pw = String(password || '');
   const bad = () => res.status(401).json({ error: 'Invalid username or password' });
   if (as === 'admin') {
-    const a = await get('admins/' + encKey(username || ''));
-    if (!a || !bcrypt.compareSync(password || '', a.passwordHash || '')) return bad();
+    // String() blocks NoSQL-injection objects such as {"$ne": null}
+    const a = await col('admins').findOne({ _id: String(username || '') });
+    if (!a || !bcrypt.compareSync(pw, a.passwordHash || '')) return bad();
     return res.json({ token: jwt.sign({ role: 'admin' }, SECRET, { expiresIn: '8h' }) });
   }
   const id = String(as || '');
-  const e = okKey(id) ? await get('employees/' + id) : null;
-  if (!e || !bcrypt.compareSync(password || '', e.passwordHash || '')) return res.status(401).json({ error: 'Incorrect password' });
+  const e = okKey(id) ? await col('employees').findOne({ _id: id }) : null;
+  if (!e || !bcrypt.compareSync(pw, e.passwordHash || '')) return res.status(401).json({ error: 'Incorrect password' });
   res.json({ token: jwt.sign({ role: 'employee', id }, SECRET, { expiresIn: '8h' }) });
 }));
 
 // Names only (no secrets) so the "Mode" dropdown can list staff
 app.get('/api/public/employees', h(async (req, res) => {
-  const list = toList(await get('employees')).map(e => ({ id: e.key, name: e.name }));
-  list.sort((x, y) => (x.id < y.id ? -1 : 1));
-  res.json(list);
+  const rows = await col('employees').find({}, { projection: { name: 1 } }).toArray();
+  const out = rows.map(e => ({ id: e._id, name: e.name }));
+  out.sort((x, y) => (x.id < y.id ? -1 : 1));
+  res.json(out);
 }));
 
 app.get('/api/events', auth, (req, res) => {
@@ -159,44 +141,37 @@ app.get('/api/events', auth, (req, res) => {
 // Admin gets everything, employee gets only own records
 app.get('/api/data', auth, h(async (req, res) => {
   const a = req.user.role === 'admin', id = req.user.id;
-  const sub = async kind => a ? await get(kind) : { [id]: await get(`${kind}/${id}`) };
+  const f = a ? {} : { empId: id };
 
   const sess = {};
-  flatTree(await sub('punches'))
-    .sort((x, y) => (x.in < y.in ? -1 : x.in > y.in ? 1 : x.key < y.key ? -1 : 1))
+  (await list('punches', f)).sort(byIn)
     .forEach(p => (sess[p.empId + '|' + p.date] ||= []).push({ in: p.in, out: p.out || null }));
 
   const ots = {};
-  flatTree(await sub('overtime'))
-    .sort((x, y) => (x.start < y.start ? -1 : 1))
+  (await list('overtime', f)).sort((x, y) => (x.start < y.start ? -1 : 1))
     .forEach(o => (ots[o.empId + '|' + o.date] ||= []).push({ start: o.start, end: o.end, hours: hoursBetween(o.start, o.end) }));
 
   const brs = {};
-  flatTree(await sub('breaks'))
-    .sort((x, y) => x.start - y.start)
+  (await list('breaks', f)).sort((x, y) => x.start - y.start)
     .forEach(b => (brs[b.empId + '|' + b.date] ||= []).push({ kind: b.kind, start: b.start, end: b.end || null }));
 
-  const empTree = a ? await get('employees') : { [id]: await get('employees/' + id) };
-  const employees = Object.entries(empTree || {}).filter(([, v]) => v).map(([k, v]) => E(k, v))
+  const employees = (await list('employees', a ? {} : { _id: id })).map(e => E(e.key, e))
     .sort((x, y) => (x.id < y.id ? -1 : 1));
 
-  const attendanceLogs = [];
-  Object.entries((await sub('attendance')) || {}).forEach(([empId, days]) =>
-    Object.entries(days || {}).forEach(([date, r]) => {
-      const k = empId + '|' + date;
-      attendanceLogs.push({
-        id: `${empId}__${date}`, empId, date, clockIn: r.clockIn || null, clockOut: r.clockOut || null,
-        hoursWorked: r.hours || 0, overtimeHours: r.ot || 0, status: r.status, punches: r.punches || 0,
-        sessions: sess[k] || [], overtimeSlots: ots[k] || [],
-        breakMinutes: r.breakMin || 0, lunchMinutes: r.lunchMin || 0, deductedHours: r.deduct || 0,
-        breakSlots: brs[k] || [], _seq: r.seq || 0
-      });
-    }));
+  const attendanceLogs = (await list('attendance', f)).map(r => {
+    const k = r.empId + '|' + r.date;
+    return {
+      id: `${r.empId}__${r.date}`, empId: r.empId, date: r.date, clockIn: r.clockIn || null, clockOut: r.clockOut || null,
+      hoursWorked: r.hours || 0, overtimeHours: r.ot || 0, status: r.status, punches: r.punches || 0,
+      sessions: sess[k] || [], overtimeSlots: ots[k] || [],
+      breakMinutes: r.breakMin || 0, lunchMinutes: r.lunchMin || 0, deductedHours: r.deduct || 0,
+      breakSlots: brs[k] || [], _seq: r.seq || 0
+    };
+  });
   attendanceLogs.sort((x, y) => (x.date < y.date ? 1 : x.date > y.date ? -1 : y._seq - x._seq));
   attendanceLogs.forEach(l => delete l._seq);
 
-  const leaveRequests = toList(await get('leaves'))
-    .filter(r => a || r.empId === id)
+  const leaveRequests = (await list('leaves', a ? {} : { empId: id }))
     .sort((x, y) => (y.seq || 0) - (x.seq || 0))
     .map(r => V(r.key, r));
 
@@ -226,11 +201,11 @@ function checkEmployee(body, needPassword) {
 app.post('/api/employees', auth, adminOnly, h(async (req, res) => {
   const v = checkEmployee(req.body, true);
   if (v.error) return res.status(400).json({ error: v.error });
-  const keys = Object.keys((await get('employees')) || {});
+  const keys = (await col('employees').find({}, { projection: { _id: 1 } }).toArray()).map(d => d._id);
   const maxNum = keys.reduce((m, k) => Math.max(m, parseInt(k.slice(4), 10) || 0), 100);
   const id = 'EMP-' + (maxNum + 1);
-  await set('employees/' + id, {
-    name: v.name, passwordHash: bcrypt.hashSync(v.password, 10), dept: 'Staff', role: v.role,
+  await col('employees').insertOne({
+    _id: id, name: v.name, passwordHash: bcrypt.hashSync(v.password, 10), dept: 'Staff', role: v.role,
     hourlyRate: v.hourlyRate, workStart: v.workStart, workEnd: v.workEnd, joined: today()
   });
   broadcast(); res.json({ ok: true });
@@ -239,18 +214,17 @@ app.post('/api/employees', auth, adminOnly, h(async (req, res) => {
 app.put('/api/employees/:id', auth, adminOnly, h(async (req, res) => {
   const v = checkEmployee(req.body, false);
   if (v.error) return res.status(400).json({ error: v.error });
-  const id = req.params.id;
-  if (!(await get('employees/' + id))) return res.status(404).json({ error: 'Employee not found' });
   const upd = { name: v.name, role: v.role, hourlyRate: v.hourlyRate, workStart: v.workStart, workEnd: v.workEnd };
   if (v.password) upd.passwordHash = bcrypt.hashSync(v.password, 10);
-  await update('employees/' + id, upd);
+  const r = await col('employees').updateOne({ _id: req.params.id }, { $set: upd });
+  if (!r.matchedCount) return res.status(404).json({ error: 'Employee not found' });
   broadcast(); res.json({ ok: true });
 }));
 
 app.delete('/api/employees/:id', auth, adminOnly, h(async (req, res) => {
   const id = req.params.id;
-  await Promise.all(['punches', 'overtime', 'breaks', 'attendance', 'employees'].map(k => remove(`${k}/${id}`)));
-  for (const l of toList(await get('leaves')).filter(l => l.empId === id)) await remove('leaves/' + l.key);
+  await Promise.all(['punches', 'overtime', 'breaks', 'attendance', 'leaves'].map(k => col(k).deleteMany({ empId: id })));
+  await col('employees').deleteOne({ _id: id });
   broadcast(); res.json({ ok: true });
 }));
 
@@ -262,12 +236,11 @@ app.delete('/api/employees/:id', auth, adminOnly, h(async (req, res) => {
 // - Overtime = ONLY the exact timing the employee declared. Never automatic, never inside the shift.
 // - LATE only if the first punch-in is later than the shift start + GRACE_MIN minutes.
 async function recalc(empId, date) {
-  const ps = (await dayList('punches', empId, date))
-    .sort((x, y) => (x.in < y.in ? -1 : x.in > y.in ? 1 : x.key < y.key ? -1 : 1));
-  const attPath = `attendance/${empId}/${date}`;
-  if (!ps.length) { await remove(attPath); return; }
+  const ps = (await dayList('punches', empId, date)).sort(byIn);
+  const _id = `${empId}__${date}`;
+  if (!ps.length) { await col('attendance').deleteOne({ _id }); return; }
 
-  const emp = (await get('employees/' + empId)) || {};
+  const emp = (await col('employees').findOne({ _id: empId })) || {};
   const ws = emp.workStart || '09:00', we = emp.workEnd || '17:00';
 
   const regMin = ps.reduce((a, p) => a + (p.out ? shiftOverlapMin(mins(p.in), mins(p.out), ws, we) : 0), 0);
@@ -288,59 +261,50 @@ async function recalc(empId, date) {
   const count = ps.length + ps.filter(p => p.out).length;     // every IN and every OUT
   const status = mins(first) > mins(ws) + GRACE_MIN ? 'LATE' : 'PRESENT';
 
-  const prev = await get(attPath);
-  await set(attPath, {
-    id: `${empId}__${date}`, empId, date, clockIn: first, clockOut: out, hours, ot, status, punches: count,
+  const prev = await col('attendance').findOne({ _id });
+  await col('attendance').replaceOne({ _id }, {
+    _id, empId, date, clockIn: first, clockOut: out, hours, ot, status, punches: count,
     breakMin: brk, lunchMin: lun, deduct, seq: (prev && prev.seq) || Date.now()
-  });
+  }, { upsert: true });
 }
 
 async function closeBreaks(empId, date, atMs) {
-  for (const b of (await dayList('breaks', empId, date)).filter(b => !b.end))
-    await update(`breaks/${empId}/${date}/${b.key}`, { end: atMs });
+  await col('breaks').updateMany({ empId, date, end: null }, { $set: { end: atMs } });
 }
 
 // Sessions / breaks left open on an earlier day are closed so nobody gets locked out
 async function closeStale(empId) {
   const t = today();
-  const brTree = (await get('breaks/' + empId)) || {};
-  for (const [date, items] of Object.entries(brTree)) {
-    if (date === t) continue;
-    let changed = false;
-    for (const [key, b] of Object.entries(items || {})) {
-      if (b.end) continue;
-      await update(`breaks/${empId}/${date}/${key}`, { end: b.start + (b.kind === 'LUNCH' ? LUNCH_ALLOWED_MIN : BREAK_ALLOWED_MIN) * 60000 });
-      changed = true;
-    }
-    if (changed) await recalc(empId, date);
+  const changedDates = new Set();
+
+  for (const b of await list('breaks', { empId, date: { $ne: t }, end: null })) {
+    const allowed = b.kind === 'LUNCH' ? LUNCH_ALLOWED_MIN : BREAK_ALLOWED_MIN;
+    await col('breaks').updateOne({ _id: b.key }, { $set: { end: b.start + allowed * 60000 } });
+    changedDates.add(b.date);
   }
+
   let staleCount = 0;
-  const pTree = (await get('punches/' + empId)) || {};
-  for (const [date, items] of Object.entries(pTree)) {
-    if (date === t) continue;
-    let changed = false;
-    for (const [key, p] of Object.entries(items || {})) {
-      if (p.out) continue;
-      await update(`punches/${empId}/${date}/${key}`, { out: '23:59' });
-      changed = true; staleCount++;
-    }
-    if (changed) await recalc(empId, date);
+  for (const p of await list('punches', { empId, date: { $ne: t }, out: null })) {
+    await col('punches').updateOne({ _id: p.key }, { $set: { out: '23:59' } });
+    changedDates.add(p.date); staleCount++;
   }
+
+  for (const date of changedDates) await recalc(empId, date);
   return staleCount;
 }
 
 const onApprovedLeave = async (empId, d) =>
-  toList(await get('leaves')).some(r => r.empId === empId && r.status === 'APPROVED' && r.startDate <= d && r.endDate >= d);
+  !!(await col('leaves').findOne({ empId, status: 'APPROVED', startDate: { $lte: d }, endDate: { $gte: d } }));
 
 app.post('/api/clock-in', auth, empOnly, h(async (req, res) => {
   const id = req.user.id, d = today();
-  if (!(await get('employees/' + id))) return res.status(403).json({ error: 'Employee not found' });
+  if (!(await col('employees').findOne({ _id: id }))) return res.status(403).json({ error: 'Employee not found' });
   await closeStale(id);
   if (await onApprovedLeave(id, d))
     return res.status(400).json({ error: 'You are on leave today, so you cannot punch in.' });
   if ((await dayList('punches', id, d)).some(p => !p.out))
     return res.status(400).json({ error: 'You are already punched in. Punch out first.' });
-  await push(`punches/${id}/${d}`, { in: nowHM() });
+  await insert('punches', { empId: id, date: d, in: nowHM(), out: null }, 'P-');
   await recalc(id, d);
   broadcast(); res.json({ ok: true });
 }));
@@ -348,13 +312,13 @@ app.post('/api/clock-in', auth, empOnly, h(async (req, res) => {
 app.post('/api/clock-out', auth, empOnly, h(async (req, res) => {
   const id = req.user.id, d = today();
   const staleClosed = await closeStale(id);
-  const open = (await dayList('punches', id, d)).filter(p => !p.out).pop();
+  const open = (await dayList('punches', id, d)).sort(byIn).filter(p => !p.out).pop();
   if (!open) {
     if (staleClosed) { broadcast(); return res.json({ ok: true, note: 'Previous open session closed' }); }
     return res.status(400).json({ error: 'You are not punched in.' });
   }
   await closeBreaks(id, d, Date.now());                       // punching out ends a running break / lunch
-  await update(`punches/${id}/${d}/${open.key}`, { out: nowHM() });
+  await col('punches').updateOne({ _id: open.key }, { $set: { out: nowHM() } });
   await recalc(id, d);
   broadcast(); res.json({ ok: true });
 }));
@@ -373,14 +337,14 @@ app.post('/api/overtime', auth, empOnly, h(async (req, res) => {
     return res.status(400).json({ error: 'Punch in first. Overtime can only be added on a day you attended.' });
 
   // Overtime must be OUTSIDE the regular timing set by the admin (regular hours are paid separately)
-  const emp = (await get('employees/' + id)) || {};
+  const emp = (await col('employees').findOne({ _id: id })) || {};
   const ws = emp.workStart || '09:00', we = emp.workEnd || '17:00';
   if (shiftOverlapMin(mins(start), mins(end), ws, we) > 0)
     return res.status(400).json({ error: `Overtime must be outside your regular timing (${ws} - ${we}).` });
 
   const clash = (await dayList('overtime', id, d)).some(o => mins(start) < mins(o.end) && mins(end) > mins(o.start));
   if (clash) return res.status(400).json({ error: 'This overlaps an overtime slot you already added today.' });
-  await push(`overtime/${id}/${d}`, { start, end });
+  await insert('overtime', { empId: id, date: d, start, end }, 'O-');
   await recalc(id, d);
   broadcast(); res.json({ ok: true });
 }));
@@ -396,16 +360,16 @@ app.post('/api/break/start', auth, empOnly, h(async (req, res) => {
     return res.status(400).json({ error: 'Punch in first. You can take a break only while punched in.' });
   if ((await dayList('breaks', id, d)).some(b => !b.end))
     return res.status(400).json({ error: 'You are already on a break. End it first.' });
-  await push(`breaks/${id}/${d}`, { kind, start: Date.now() });
+  await insert('breaks', { empId: id, date: d, kind, start: Date.now(), end: null }, 'B-');
   await recalc(id, d);
   broadcast(); res.json({ ok: true });
 }));
 
 app.post('/api/break/end', auth, empOnly, h(async (req, res) => {
   const id = req.user.id;
-  const open = flatTree({ [id]: await get('breaks/' + id) }).filter(b => !b.end).pop();
+  const open = (await list('breaks', { empId: id, end: null })).sort((x, y) => x.start - y.start).pop();
   if (!open) return res.status(400).json({ error: 'You are not on a break.' });
-  await update(`breaks/${id}/${open.date}/${open.key}`, { end: Date.now() });
+  await col('breaks').updateOne({ _id: open.key }, { $set: { end: Date.now() } });
   await recalc(id, open.date);
   broadcast(); res.json({ ok: true });
 }));
@@ -418,14 +382,15 @@ app.post('/api/leave-today', auth, empOnly, h(async (req, res) => {
     return res.status(400).json({ error: 'You are already on leave today.' });
   if ((await dayList('punches', id, d)).length)
     return res.status(400).json({ error: 'You have already punched in today, so you cannot take leave for today.' });
-  await set('leaves/' + newId('LV-'), {
+  await insert('leaves', {
     empId: id, type: 'Sudden Leave', startDate: d, endDate: d,
     reason: 'Marked on leave by employee (no prior application)', status: 'APPROVED', seen: true, seq: Date.now()
-  });
-  await set(`attendance/${id}/${d}`, {
-    id: `${id}__${d}`, empId: id, date: d, clockIn: null, clockOut: null, hours: 0, ot: 0,
+  }, 'LV-');
+  const _id = `${id}__${d}`;
+  await col('attendance').replaceOne({ _id }, {
+    _id, empId: id, date: d, clockIn: null, clockOut: null, hours: 0, ot: 0,
     status: 'ON_LEAVE', punches: 0, breakMin: 0, lunchMin: 0, deduct: 0, seq: Date.now()
-  });
+  }, { upsert: true });
   broadcast(); res.json({ ok: true });
 }));
 
@@ -434,11 +399,12 @@ app.post('/api/attendance', auth, adminOnly, h(async (req, res) => {
   const { empId, date, clockIn, clockOut, status } = req.body || {};
   if (!empId || !validDate(date) || !validTime(clockIn) || !validTime(clockOut))
     return res.status(400).json({ error: 'Employee, date, clock in and clock out are required' });
-  if (!okKey(empId) || !(await get('employees/' + empId))) return res.status(400).json({ error: 'Employee not found' });
-  await push(`punches/${empId}/${date}`, { in: clockIn, out: clockOut });
+  if (typeof empId !== 'string' || !okKey(empId) || !(await col('employees').findOne({ _id: empId })))
+    return res.status(400).json({ error: 'Employee not found' });
+  await insert('punches', { empId, date, in: clockIn, out: clockOut }, 'P-');
   await recalc(empId, date);
   if (status && ['PRESENT', 'LATE', 'ABSENT', 'ON_LEAVE'].includes(status))
-    await update(`attendance/${empId}/${date}`, { status });
+    await col('attendance').updateOne({ _id: `${empId}__${date}` }, { $set: { status } });
   broadcast(); res.json({ ok: true });
 }));
 
@@ -447,12 +413,11 @@ app.delete('/api/attendance/:id', auth, adminOnly, h(async (req, res) => {
   const m = /^(.+)__(\d{4}-\d{2}-\d{2})$/.exec(req.params.id);
   if (!m) return res.status(400).json({ error: 'Bad log id' });
   const [, empId, date] = m;
-  const row = await get(`attendance/${empId}/${date}`);
-  await Promise.all(['punches', 'overtime', 'breaks', 'attendance'].map(k => remove(`${k}/${empId}/${date}`)));
-  if (row && row.status === 'ON_LEAVE') {
-    for (const l of toList(await get('leaves')).filter(l => l.empId === empId && l.type === 'Sudden Leave' && l.startDate === date && l.endDate === date))
-      await remove('leaves/' + l.key);
-  }
+  const row = await col('attendance').findOne({ _id: req.params.id });
+  await Promise.all(['punches', 'overtime', 'breaks'].map(k => col(k).deleteMany({ empId, date })));
+  await col('attendance').deleteOne({ _id: req.params.id });
+  if (row && row.status === 'ON_LEAVE')
+    await col('leaves').deleteMany({ empId, type: 'Sudden Leave', startDate: date, endDate: date });
   broadcast(); res.json({ ok: true });
 }));
 
@@ -462,10 +427,10 @@ app.post('/api/leaves', auth, empOnly, h(async (req, res) => {
   if (!type || !validDate(startDate) || !validDate(endDate) || !String(reason || '').trim())
     return res.status(400).json({ error: 'Leave type, start date, end date and reason are required' });
   if (endDate < startDate) return res.status(400).json({ error: 'End date cannot be before the start date' });
-  await set('leaves/' + newId('LV-'), {
+  await insert('leaves', {
     empId: req.user.id, type: String(type), startDate, endDate, reason: String(reason).trim(),
     status: 'PENDING', seen: false, seq: Date.now()
-  });
+  }, 'LV-');
   broadcast(); res.json({ ok: true });
 }));
 
@@ -473,19 +438,18 @@ app.post('/api/leaves', auth, empOnly, h(async (req, res) => {
 app.patch('/api/leaves/:id', auth, adminOnly, h(async (req, res) => {
   const s = (req.body || {}).status;
   if (!['APPROVED', 'REJECTED'].includes(s)) return res.status(400).json({ error: 'Bad status' });
-  if (!(await get('leaves/' + req.params.id))) return res.status(404).json({ error: 'Leave request not found' });
-  await update('leaves/' + req.params.id, { status: s, seen: false });
+  const r = await col('leaves').updateOne({ _id: req.params.id }, { $set: { status: s, seen: false } });
+  if (!r.matchedCount) return res.status(404).json({ error: 'Leave request not found' });
   broadcast(); res.json({ ok: true });
 }));
 
 // Employee closed the notification pop-up
 app.patch('/api/leaves/:id/seen', auth, empOnly, h(async (req, res) => {
-  const l = await get('leaves/' + req.params.id);
-  if (l && l.empId === req.user.id) await update('leaves/' + req.params.id, { seen: true });
+  await col('leaves').updateOne({ _id: req.params.id, empId: req.user.id }, { $set: { seen: true } });
   res.json({ ok: true });
 }));
 
-app.get('/api/version', (req, res) => res.json({ version: '1.8.0', db: 'firebase-realtime-db', features: ['overtime', 'leave-today', 'break-lunch', 'grace', 'shift-hours'] }));
+app.get('/api/version', (req, res) => res.json({ version: '1.9.0', db: 'mongodb', features: ['overtime', 'leave-today', 'break-lunch', 'grace', 'shift-hours'] }));
 
 app.use('/api', (req, res) => res.status(404).json({
   error: `API route not found: ${req.method} ${req.originalUrl}. The server is running an old server.js - replace it and restart.`
@@ -496,13 +460,24 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Server error: ' + (err && err.message ? err.message : 'unknown') });
 });
 
-// Seed the first admin (only when there is none), then start
+// Connect, create indexes, seed the first admin (only when there is none), then start
 (async () => {
-  const admins = await get('admins');
-  if (!admins) {
+  await client.connect();
+  mdb = client.db(MONGODB_DB);
+
+  await Promise.all([
+    col('punches').createIndex({ empId: 1, date: 1 }),
+    col('overtime').createIndex({ empId: 1, date: 1 }),
+    col('breaks').createIndex({ empId: 1, date: 1 }),
+    col('breaks').createIndex({ empId: 1, end: 1 }),
+    col('attendance').createIndex({ empId: 1, date: 1 }),
+    col('leaves').createIndex({ empId: 1 })
+  ]);
+
+  if (!(await col('admins').findOne({}))) {
     const user = process.env.ADMIN_USER || 'admin@vr';
     const pass = process.env.ADMIN_PASS || 'RojaRaj@1721';
-    await set('admins/' + encKey(user), { username: user, passwordHash: bcrypt.hashSync(pass, 10) });
+    await col('admins').insertOne({ _id: user, username: user, passwordHash: bcrypt.hashSync(pass, 10) });
   }
-  app.listen(PORT, () => console.log(`Attendance system running on port ${PORT} (timezone: ${TZ}, db: Firebase Realtime Database)`));
-})().catch(e => { console.error('Firebase connection failed:', e); process.exit(1); });
+  app.listen(PORT, () => console.log(`Attendance system running on port ${PORT} (timezone: ${TZ}, db: MongoDB "${MONGODB_DB}")`));
+})().catch(e => { console.error('MongoDB connection failed:', e); process.exit(1); });
