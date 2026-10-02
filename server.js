@@ -1,11 +1,14 @@
 const express = require('express');
-const { DatabaseSync } = require('node:sqlite'); // built into Node 22.13+ / 24
+const { Pool, types } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+
+// Postgres returns BIGINT as string; we want numbers (used for break timestamps)
+types.setTypeParser(20, v => parseInt(v, 10));
 
 const SECRET = process.env.JWT_SECRET || 'change-this-secret-in-production';
 // Late rule: LATE only if the first punch-in is MORE than GRACE_MIN minutes after the employee's own shift start
-// (admin sets 10:00 AM, grace 5 -> 10:05 is on time, 10:06 is LATE). Override with env GRACE_MIN.
 const GRACE_MIN = Number(process.env.GRACE_MIN ?? 5);
 // Break / lunch allowance per day. Time taken beyond this is deducted from the day's worked hours.
 const BREAK_ALLOWED_MIN = 30;
@@ -15,7 +18,11 @@ const LUNCH_ALLOWED_MIN = 60;
 const TZ = process.env.APP_TZ || 'Asia/Kolkata';
 const PORT = process.env.PORT || 3000;
 
-// Current date/time in the configured timezone (not the server's own timezone)
+if (!process.env.DATABASE_URL) {
+  console.error('DATABASE_URL is not set. Create a free Postgres database (e.g. Neon) and set DATABASE_URL.');
+  process.exit(1);
+}
+
 const tzParts = () => {
   const p = {};
   new Intl.DateTimeFormat('en-GB', {
@@ -29,63 +36,70 @@ const nowHM = () => { const p = tzParts(); return `${p.hour}:${p.minute}`; };
 
 const app = express();
 app.use(express.json());
-// no-store so the browser never keeps an old index.html / backend.js
 app.use(express.static('public', { etag: false, setHeaders: res => res.set('Cache-Control', 'no-store') }));
 
-// ---------- DATABASE ----------
-const db = new DatabaseSync('attendflow.db');
+// ---------- DATABASE (PostgreSQL - data survives redeploys) ----------
+const isLocal = /localhost|127\.0\.0\.1/.test(process.env.DATABASE_URL);
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: isLocal ? false : { rejectUnauthorized: false }
+});
+pool.on('error', e => console.error('DB pool error:', e.message));
 
-// Remember if the overtime table is new (older databases had auto-calculated overtime that we reset once)
-const hadOvertimeTable = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='overtime'").get();
+// Keep the "?" placeholders used below: convert to $1, $2 ...
+const toPg = s => { let i = 0; return s.replace(/\?/g, () => '$' + (++i)); };
+const q = async (s, ...a) => (await pool.query(toPg(s), a)).rows;
+const one = async (s, ...a) => (await q(s, ...a))[0];
+const run = (s, ...a) => pool.query(toPg(s), a);
 
-db.exec(`
+// Wrap async routes so errors go to the error handler instead of hanging
+const h = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+async function initDb() {
+  await pool.query(`
 CREATE TABLE IF NOT EXISTS admins(username TEXT PRIMARY KEY, password_hash TEXT);
 CREATE TABLE IF NOT EXISTS employees(
   id TEXT PRIMARY KEY, name TEXT, password_hash TEXT,
-  dept TEXT DEFAULT 'Staff', role TEXT, hourly_rate REAL,
+  dept TEXT DEFAULT 'Staff', role TEXT, hourly_rate DOUBLE PRECISION,
   work_start TEXT DEFAULT '09:00', work_end TEXT DEFAULT '17:00', joined TEXT);
 CREATE TABLE IF NOT EXISTS attendance(
-  id TEXT PRIMARY KEY, emp_id TEXT, date TEXT, clock_in TEXT, clock_out TEXT,
-  hours REAL DEFAULT 0, ot REAL DEFAULT 0, status TEXT, punches INTEGER DEFAULT 0);
+  id TEXT PRIMARY KEY, seq BIGSERIAL, emp_id TEXT, date TEXT, clock_in TEXT, clock_out TEXT,
+  hours DOUBLE PRECISION DEFAULT 0, ot DOUBLE PRECISION DEFAULT 0, status TEXT, punches INTEGER DEFAULT 0,
+  break_min DOUBLE PRECISION DEFAULT 0, lunch_min DOUBLE PRECISION DEFAULT 0, deduct DOUBLE PRECISION DEFAULT 0);
 CREATE TABLE IF NOT EXISTS punches(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, emp_id TEXT, date TEXT, punch_in TEXT, punch_out TEXT);
+  id SERIAL PRIMARY KEY, emp_id TEXT, date TEXT, punch_in TEXT, punch_out TEXT);
 CREATE TABLE IF NOT EXISTS overtime(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, emp_id TEXT, date TEXT, ot_start TEXT, ot_end TEXT);
+  id SERIAL PRIMARY KEY, emp_id TEXT, date TEXT, ot_start TEXT, ot_end TEXT);
 CREATE TABLE IF NOT EXISTS breaks(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, emp_id TEXT, date TEXT, kind TEXT, start_ms INTEGER, end_ms INTEGER);
+  id SERIAL PRIMARY KEY, emp_id TEXT, date TEXT, kind TEXT, start_ms BIGINT, end_ms BIGINT);
 CREATE TABLE IF NOT EXISTS leaves(
-  id TEXT PRIMARY KEY, emp_id TEXT, type TEXT, start_date TEXT, end_date TEXT,
+  id TEXT PRIMARY KEY, seq BIGSERIAL, emp_id TEXT, type TEXT, start_date TEXT, end_date TEXT,
   reason TEXT, status TEXT DEFAULT 'PENDING', seen INTEGER DEFAULT 0);
+CREATE INDEX IF NOT EXISTS idx_att_emp_date ON attendance(emp_id, date);
+CREATE INDEX IF NOT EXISTS idx_punch_emp_date ON punches(emp_id, date);
 `);
-// Upgrade older databases (these fail harmlessly if the column already exists)
-try { db.exec('ALTER TABLE attendance ADD COLUMN punches INTEGER DEFAULT 0'); } catch {}
-try { db.exec("ALTER TABLE employees ADD COLUMN work_start TEXT DEFAULT '09:00'"); } catch {}
-try { db.exec("ALTER TABLE employees ADD COLUMN work_end TEXT DEFAULT '17:00'"); } catch {}
-try { db.exec('ALTER TABLE employees ADD COLUMN joined TEXT'); } catch {}
-try { db.exec('ALTER TABLE attendance ADD COLUMN break_min REAL DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE attendance ADD COLUMN lunch_min REAL DEFAULT 0'); } catch {}
-try { db.exec('ALTER TABLE attendance ADD COLUMN deduct REAL DEFAULT 0'); } catch {}
-// Old employees: "joined" = their first attendance date, or today if they have none
-db.prepare(`UPDATE employees SET joined = COALESCE(
-  (SELECT MIN(date) FROM attendance WHERE attendance.emp_id = employees.id), ?) WHERE joined IS NULL`).run(today());
-// Leave notifications: leaves that were already decided before this upgrade are marked as seen
-let addedSeen = false;
-try { db.exec('ALTER TABLE leaves ADD COLUMN seen INTEGER DEFAULT 0'); addedSeen = true; } catch {}
-if (addedSeen) db.exec("UPDATE leaves SET seen=1 WHERE status<>'PENDING'");
-// Overtime is now only what the employee declares (with timing). Clear old automatic overtime once.
-if (!hadOvertimeTable) db.exec('UPDATE attendance SET ot=0');
-
-if (!db.prepare('SELECT 1 FROM admins').get()) {
-  db.prepare('INSERT INTO admins VALUES(?,?)').run('admin@vr', bcrypt.hashSync('RojaRaj@1721', 10));
+  if (!(await one('SELECT 1 FROM admins'))) {
+    // Set ADMIN_USER / ADMIN_PASS in Render env vars (defaults kept so existing login keeps working)
+    const user = process.env.ADMIN_USER || 'admin@vr';
+    const pass = process.env.ADMIN_PASS || 'RojaRaj@1721';
+    await run('INSERT INTO admins VALUES(?,?)', user, bcrypt.hashSync(pass, 10));
+  }
 }
-const q = (s, ...a) => db.prepare(s).all(...a);
-const one = (s, ...a) => db.prepare(s).get(...a);
-const run = (s, ...a) => db.prepare(s).run(...a);
 
-const mins = t => { const [h, m] = t.split(':'); return h * 60 + +m; };
-const hoursBetween = (i, o) => { let h = (mins(o) - mins(i)) / 60; if (h < 0) h += 24; return h; };
+const mins = t => { const [hh, m] = t.split(':'); return hh * 60 + +m; };
+const hoursBetween = (i, o) => { let x = (mins(o) - mins(i)) / 60; if (x < 0) x += 24; return x; };
+const overlap = (a1, a2, b1, b2) => Math.max(0, Math.min(a2, b2) - Math.max(a1, b1));
+const newId = prefix => prefix + Date.now() + '-' + crypto.randomBytes(3).toString('hex');
 
-// Row -> shape the frontend understands (times are stored/sent as 24h "HH:MM", the UI shows 12h)
+// Minutes of [a,b] (24h minutes) that fall inside the shift [ws,we] (handles overnight shifts)
+function shiftOverlapMin(a, b, ws, we) {
+  let s = mins(ws), e = mins(we);
+  if (e <= s) e += 1440;
+  if (b < a) b += 1440;
+  return overlap(a, b, s, e) + overlap(a + 1440, b + 1440, s, e);
+}
+
+// Row -> shape the frontend understands
 const E = r => ({
   id: r.id, name: r.name, dept: r.dept, role: r.role, hourlyRate: r.hourly_rate,
   workStart: r.work_start || '09:00', workEnd: r.work_end || '17:00', joined: r.joined || null
@@ -106,6 +120,7 @@ const V = r => ({
 // ---------- REALTIME (Server-Sent Events) ----------
 const clients = new Set();
 const broadcast = () => clients.forEach(r => r.write('data: change\n\n'));
+setInterval(() => clients.forEach(r => r.write(': ping\n\n')), 25000); // keeps the stream alive behind proxies
 
 // ---------- AUTH ----------
 function auth(req, res, next) {
@@ -118,22 +133,20 @@ function auth(req, res, next) {
 const adminOnly = (req, res, next) => req.user.role === 'admin' ? next() : res.status(403).json({ error: 'Admin only' });
 const empOnly = (req, res, next) => req.user.role === 'employee' ? next() : res.status(403).json({ error: 'Employee only' });
 
-app.post('/api/login', (req, res) => {
+app.post('/api/login', h(async (req, res) => {
   const { as, username, password } = req.body || {};
   const bad = () => res.status(401).json({ error: 'Invalid username or password' });
   if (as === 'admin') {
-    const a = one('SELECT * FROM admins WHERE username=?', username);
+    const a = await one('SELECT * FROM admins WHERE username=?', String(username || ''));
     if (!a || !bcrypt.compareSync(password || '', a.password_hash)) return bad();
     return res.json({ token: jwt.sign({ role: 'admin' }, SECRET, { expiresIn: '8h' }) });
   }
-  // Employee: the profile is chosen in the Mode switch, so only the password is needed
-  const e = one('SELECT * FROM employees WHERE id=?', as);
+  const e = await one('SELECT * FROM employees WHERE id=?', String(as || ''));
   if (!e || !bcrypt.compareSync(password || '', e.password_hash || '')) return res.status(401).json({ error: 'Incorrect password' });
   res.json({ token: jwt.sign({ role: 'employee', id: e.id }, SECRET, { expiresIn: '8h' }) });
-});
+}));
 
-// Names only (no secrets) so the "Mode" dropdown can list staff
-app.get('/api/public/employees', (req, res) => res.json(q('SELECT id,name FROM employees ORDER BY id')));
+app.get('/api/public/employees', h(async (req, res) => res.json(await q('SELECT id,name FROM employees ORDER BY id'))));
 
 app.get('/api/events', auth, (req, res) => {
   res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
@@ -142,32 +155,32 @@ app.get('/api/events', auth, (req, res) => {
   req.on('close', () => clients.delete(res));
 });
 
-// Admin gets everything, employee gets only own records
-app.get('/api/data', auth, (req, res) => {
+app.get('/api/data', auth, h(async (req, res) => {
   const a = req.user.role === 'admin', id = req.user.id;
-  const punchRows = a ? q('SELECT * FROM punches ORDER BY punch_in, id') : q('SELECT * FROM punches WHERE emp_id=? ORDER BY punch_in, id', id);
+  const punchRows = a ? await q('SELECT * FROM punches ORDER BY punch_in, id') : await q('SELECT * FROM punches WHERE emp_id=? ORDER BY punch_in, id', id);
   const sess = {};
   punchRows.forEach(p => (sess[p.emp_id + '|' + p.date] ||= []).push({ in: p.punch_in, out: p.punch_out }));
-  const otRows = a ? q('SELECT * FROM overtime ORDER BY ot_start, id') : q('SELECT * FROM overtime WHERE emp_id=? ORDER BY ot_start, id', id);
+  const otRows = a ? await q('SELECT * FROM overtime ORDER BY ot_start, id') : await q('SELECT * FROM overtime WHERE emp_id=? ORDER BY ot_start, id', id);
   const ots = {};
   otRows.forEach(o => (ots[o.emp_id + '|' + o.date] ||= []).push({ start: o.ot_start, end: o.ot_end, hours: hoursBetween(o.ot_start, o.ot_end) }));
-  const brRows = a ? q('SELECT * FROM breaks ORDER BY start_ms, id') : q('SELECT * FROM breaks WHERE emp_id=? ORDER BY start_ms, id', id);
+  const brRows = a ? await q('SELECT * FROM breaks ORDER BY start_ms, id') : await q('SELECT * FROM breaks WHERE emp_id=? ORDER BY start_ms, id', id);
   const brs = {};
   brRows.forEach(b => (brs[b.emp_id + '|' + b.date] ||= []).push({ kind: b.kind, start: b.start_ms, end: b.end_ms }));
+  const emps = a ? await q('SELECT * FROM employees ORDER BY id') : await q('SELECT * FROM employees WHERE id=?', id);
+  const logs = a ? await q('SELECT * FROM attendance ORDER BY date DESC, seq DESC') : await q('SELECT * FROM attendance WHERE emp_id=? ORDER BY date DESC, seq DESC', id);
+  const leaves = a ? await q('SELECT * FROM leaves ORDER BY seq DESC') : await q('SELECT * FROM leaves WHERE emp_id=? ORDER BY seq DESC', id);
   res.json({
-    employees: (a ? q('SELECT * FROM employees ORDER BY id') : q('SELECT * FROM employees WHERE id=?', id)).map(E),
-    attendanceLogs: (a ? q('SELECT * FROM attendance ORDER BY date DESC, rowid DESC') : q('SELECT * FROM attendance WHERE emp_id=? ORDER BY date DESC', id)).map(r => L(r, sess, ots, brs)),
-    leaveRequests: (a ? q('SELECT * FROM leaves ORDER BY rowid DESC') : q('SELECT * FROM leaves WHERE emp_id=? ORDER BY rowid DESC', id)).map(V),
+    employees: emps.map(E),
+    attendanceLogs: logs.map(r => L(r, sess, ots, brs)),
+    leaveRequests: leaves.map(V),
     config: { graceMin: GRACE_MIN, breakMin: BREAK_ALLOWED_MIN, lunchMin: LUNCH_ALLOWED_MIN },
     serverNow: Date.now()
   });
-});
+}));
 
 // ---------- EMPLOYEES (admin) ----------
 const validTime = t => /^([01]\d|2[0-3]):[0-5]\d$/.test(t || '');
-const nextId = () => 'EMP-' + ((one("SELECT MAX(CAST(SUBSTR(id,5) AS INTEGER)) m FROM employees").m || 100) + 1);
 
-// Validates the employee form and says exactly which field is wrong
 function checkEmployee(body, needPassword) {
   const b = body || {};
   const name = String(b.name || '').trim();
@@ -183,248 +196,251 @@ function checkEmployee(body, needPassword) {
   return { error, name, role, password, hourlyRate, workStart: b.workStart, workEnd: b.workEnd };
 }
 
-app.post('/api/employees', auth, adminOnly, (req, res) => {
+app.post('/api/employees', auth, adminOnly, h(async (req, res) => {
   const v = checkEmployee(req.body, true);
   if (v.error) return res.status(400).json({ error: v.error });
-  run('INSERT INTO employees(id,name,password_hash,role,hourly_rate,work_start,work_end,joined) VALUES(?,?,?,?,?,?,?,?)',
-    nextId(), v.name, bcrypt.hashSync(v.password, 10), v.role, v.hourlyRate, v.workStart, v.workEnd, today());
+  const m = (await one("SELECT MAX(CAST(SUBSTR(id,5) AS INTEGER)) AS m FROM employees")).m;
+  const id = 'EMP-' + ((m || 100) + 1);
+  await run('INSERT INTO employees(id,name,password_hash,role,hourly_rate,work_start,work_end,joined) VALUES(?,?,?,?,?,?,?,?)',
+    id, v.name, bcrypt.hashSync(v.password, 10), v.role, v.hourlyRate, v.workStart, v.workEnd, today());
   broadcast(); res.json({ ok: true });
-});
+}));
 
-app.put('/api/employees/:id', auth, adminOnly, (req, res) => {
+app.put('/api/employees/:id', auth, adminOnly, h(async (req, res) => {
   const v = checkEmployee(req.body, false);
   if (v.error) return res.status(400).json({ error: v.error });
-  run('UPDATE employees SET name=?, role=?, hourly_rate=?, work_start=?, work_end=? WHERE id=?',
+  await run('UPDATE employees SET name=?, role=?, hourly_rate=?, work_start=?, work_end=? WHERE id=?',
     v.name, v.role, v.hourlyRate, v.workStart, v.workEnd, req.params.id);
-  if (v.password) run('UPDATE employees SET password_hash=? WHERE id=?', bcrypt.hashSync(v.password, 10), req.params.id);
+  if (v.password) await run('UPDATE employees SET password_hash=? WHERE id=?', bcrypt.hashSync(v.password, 10), req.params.id);
   broadcast(); res.json({ ok: true });
-});
+}));
 
-app.delete('/api/employees/:id', auth, adminOnly, (req, res) => {
-  run('DELETE FROM punches WHERE emp_id=?', req.params.id);
-  run('DELETE FROM overtime WHERE emp_id=?', req.params.id);
-  run('DELETE FROM breaks WHERE emp_id=?', req.params.id);
-  run('DELETE FROM attendance WHERE emp_id=?', req.params.id);
-  run('DELETE FROM leaves WHERE emp_id=?', req.params.id);
-  run('DELETE FROM employees WHERE id=?', req.params.id);
+app.delete('/api/employees/:id', auth, adminOnly, h(async (req, res) => {
+  const id = req.params.id;
+  await run('DELETE FROM punches WHERE emp_id=?', id);
+  await run('DELETE FROM overtime WHERE emp_id=?', id);
+  await run('DELETE FROM breaks WHERE emp_id=?', id);
+  await run('DELETE FROM attendance WHERE emp_id=?', id);
+  await run('DELETE FROM leaves WHERE emp_id=?', id);
+  await run('DELETE FROM employees WHERE id=?', id);
   broadcast(); res.json({ ok: true });
-});
+}));
 
-// ---------- ATTENDANCE (multiple punch sessions per day) ----------
+// ---------- ATTENDANCE ----------
 
-// Rebuild the daily summary row from that day's punch sessions.
-// - LATE only if the first punch-in is later than THIS employee's shift start + GRACE_MIN minutes.
-// - Hours worked = punched hours minus the break / lunch time that went OVER the allowance.
-// - Overtime is ONLY the timing the employee declared (overtime table) - never automatic.
-function recalc(empId, date) {
-  const ps = q('SELECT * FROM punches WHERE emp_id=? AND date=? ORDER BY punch_in, id', empId, date);
-  const ex = one('SELECT id FROM attendance WHERE emp_id=? AND date=?', empId, date);
-  if (!ps.length) { if (ex) run('DELETE FROM attendance WHERE id=?', ex.id); return; }
+// Rebuild the daily summary row from that day's punches.
+// - Regular hours = ONLY the punched time that falls inside the admin-set work timing (start-end),
+//   minus break / lunch time that went over the allowance.
+// - Overtime = ONLY the exact timing the employee declared (e.g. 9:00 PM - 9:30 PM). Never automatic,
+//   and never overlaps the shift, so nothing is paid twice.
+// - LATE only if the first punch-in is later than the shift start + GRACE_MIN minutes.
+async function recalc(empId, date) {
+  const ps = await q('SELECT * FROM punches WHERE emp_id=? AND date=? ORDER BY punch_in, id', empId, date);
+  const ex = await one('SELECT id FROM attendance WHERE emp_id=? AND date=?', empId, date);
+  if (!ps.length) { if (ex) await run('DELETE FROM attendance WHERE id=?', ex.id); return; }
 
-  const emp = one('SELECT work_start FROM employees WHERE id=?', empId) || {};
-  const ws = emp.work_start || '09:00';
+  const emp = (await one('SELECT work_start, work_end FROM employees WHERE id=?', empId)) || {};
+  const ws = emp.work_start || '09:00', we = emp.work_end || '17:00';
 
-  const gross = ps.reduce((a, p) => a + (p.punch_out ? hoursBetween(p.punch_in, p.punch_out) : 0), 0);
+  // Regular minutes = punched time inside the shift window
+  const regMin = ps.reduce((a, p) => a + (p.punch_out ? shiftOverlapMin(mins(p.punch_in), mins(p.punch_out), ws, we) : 0), 0);
+  const gross = regMin / 60;
 
-  // Break / lunch minutes used today (a break still running counts up to now)
   const now = Date.now();
   let brk = 0, lun = 0;
-  q('SELECT * FROM breaks WHERE emp_id=? AND date=?', empId, date).forEach(b => {
+  (await q('SELECT * FROM breaks WHERE emp_id=? AND date=?', empId, date)).forEach(b => {
     const m = Math.max(0, ((b.end_ms || now) - b.start_ms) / 60000);
     if (b.kind === 'LUNCH') lun += m; else brk += m;
   });
   const deduct = (Math.max(0, brk - BREAK_ALLOWED_MIN) + Math.max(0, lun - LUNCH_ALLOWED_MIN)) / 60;
   const hours = Math.max(0, gross - deduct);
 
-  const ot = q('SELECT * FROM overtime WHERE emp_id=? AND date=?', empId, date)
+  const ot = (await q('SELECT * FROM overtime WHERE emp_id=? AND date=?', empId, date))
     .reduce((a, o) => a + hoursBetween(o.ot_start, o.ot_end), 0);
   const first = ps[0].punch_in, last = ps[ps.length - 1];
-  const out = last.punch_out || null;                                   // null = currently punched in
-  const count = ps.length + ps.filter(p => p.punch_out).length;          // every IN and every OUT
+  const out = last.punch_out || null;
+  const count = ps.length + ps.filter(p => p.punch_out).length;
   const status = mins(first) > mins(ws) + GRACE_MIN ? 'LATE' : 'PRESENT';
-  if (ex) run('UPDATE attendance SET clock_in=?, clock_out=?, hours=?, ot=?, punches=?, status=?, break_min=?, lunch_min=?, deduct=? WHERE id=?',
+  if (ex) await run('UPDATE attendance SET clock_in=?, clock_out=?, hours=?, ot=?, punches=?, status=?, break_min=?, lunch_min=?, deduct=? WHERE id=?',
     first, out, hours, ot, count, status, brk, lun, deduct, ex.id);
-  else run('INSERT INTO attendance(id,emp_id,date,clock_in,clock_out,hours,ot,status,punches,break_min,lunch_min,deduct) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-    'LOG-' + Date.now(), empId, date, first, out, hours, ot, status, count, brk, lun, deduct);
+  else await run('INSERT INTO attendance(id,emp_id,date,clock_in,clock_out,hours,ot,status,punches,break_min,lunch_min,deduct) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+    newId('LOG-'), empId, date, first, out, hours, ot, status, count, brk, lun, deduct);
 }
 
-// Close any break / lunch still running for that employee (used at punch-out)
-function closeBreaks(empId, date, atMs) {
-  run('UPDATE breaks SET end_ms=? WHERE emp_id=? AND date=? AND end_ms IS NULL', atMs, empId, date);
+async function closeBreaks(empId, date, atMs) {
+  await run('UPDATE breaks SET end_ms=? WHERE emp_id=? AND date=? AND end_ms IS NULL', atMs, empId, date);
 }
 
-// Sessions left open on an earlier day (forgot to punch out) are closed at 23:59 so nobody gets locked out
-function closeStale(empId) {
-  // A break forgotten on an earlier day ends after its normal allowance (no penalty for forgetting)
-  q('SELECT * FROM breaks WHERE emp_id=? AND end_ms IS NULL AND date<>?', empId, today()).forEach(b => {
-    run('UPDATE breaks SET end_ms=? WHERE id=?', b.start_ms + (b.kind === 'LUNCH' ? LUNCH_ALLOWED_MIN : BREAK_ALLOWED_MIN) * 60000, b.id);
-    recalc(b.emp_id, b.date);
-  });
-  const stale = q('SELECT * FROM punches WHERE emp_id=? AND punch_out IS NULL AND date<>?', empId, today());
-  stale.forEach(p => {
-    run('UPDATE punches SET punch_out=? WHERE id=?', '23:59', p.id);
-    recalc(p.emp_id, p.date);
-  });
+// Sessions left open on an earlier day are closed at 23:59 so nobody gets locked out
+async function closeStale(empId) {
+  const t = today();
+  for (const b of await q('SELECT * FROM breaks WHERE emp_id=? AND end_ms IS NULL AND date<>?', empId, t)) {
+    await run('UPDATE breaks SET end_ms=? WHERE id=?', b.start_ms + (b.kind === 'LUNCH' ? LUNCH_ALLOWED_MIN : BREAK_ALLOWED_MIN) * 60000, b.id);
+    await recalc(b.emp_id, b.date);
+  }
+  const stale = await q('SELECT * FROM punches WHERE emp_id=? AND punch_out IS NULL AND date<>?', empId, t);
+  for (const p of stale) {
+    await run('UPDATE punches SET punch_out=? WHERE id=?', '23:59', p.id);
+    await recalc(p.emp_id, p.date);
+  }
   return stale.length;
 }
 
 const onApprovedLeave = (empId, d) =>
-  one("SELECT 1 FROM leaves WHERE emp_id=? AND status='APPROVED' AND start_date<=? AND end_date>=?", empId, d, d);
+  one("SELECT 1 AS x FROM leaves WHERE emp_id=? AND status='APPROVED' AND start_date<=? AND end_date>=?", empId, d, d);
 
-// Employee punches IN (any number of times, as long as the previous session is closed)
-app.post('/api/clock-in', auth, empOnly, (req, res) => {
+app.post('/api/clock-in', auth, empOnly, h(async (req, res) => {
   const d = today();
-  closeStale(req.user.id);
-  // Not allowed to punch in on a day covered by approved leave
-  if (onApprovedLeave(req.user.id, d))
+  await closeStale(req.user.id);
+  if (await onApprovedLeave(req.user.id, d))
     return res.status(400).json({ error: 'You are on leave today, so you cannot punch in.' });
-  if (one('SELECT 1 FROM punches WHERE emp_id=? AND date=? AND punch_out IS NULL', req.user.id, d))
+  if (await one('SELECT 1 AS x FROM punches WHERE emp_id=? AND date=? AND punch_out IS NULL', req.user.id, d))
     return res.status(400).json({ error: 'You are already punched in. Punch out first.' });
-  run('INSERT INTO punches(emp_id,date,punch_in) VALUES(?,?,?)', req.user.id, d, nowHM());
-  recalc(req.user.id, d);
+  await run('INSERT INTO punches(emp_id,date,punch_in) VALUES(?,?,?)', req.user.id, d, nowHM());
+  await recalc(req.user.id, d);
   broadcast(); res.json({ ok: true });
-});
+}));
 
-// Employee punches OUT (closes the open session, even if it is only seconds old)
-app.post('/api/clock-out', auth, empOnly, (req, res) => {
+app.post('/api/clock-out', auth, empOnly, h(async (req, res) => {
   const d = today();
-  const staleClosed = closeStale(req.user.id);
-  const open = one('SELECT id FROM punches WHERE emp_id=? AND date=? AND punch_out IS NULL ORDER BY id DESC', req.user.id, d);
+  const staleClosed = await closeStale(req.user.id);
+  const open = await one('SELECT id FROM punches WHERE emp_id=? AND date=? AND punch_out IS NULL ORDER BY id DESC', req.user.id, d);
   if (!open) {
     if (staleClosed) { broadcast(); return res.json({ ok: true, note: 'Previous open session closed' }); }
     return res.status(400).json({ error: 'You are not punched in.' });
   }
-  closeBreaks(req.user.id, d, Date.now());                 // punching out ends a running break / lunch
-  run('UPDATE punches SET punch_out=? WHERE id=?', nowHM(), open.id);
-  recalc(req.user.id, d);
+  await closeBreaks(req.user.id, d, Date.now());
+  await run('UPDATE punches SET punch_out=? WHERE id=?', nowHM(), open.id);
+  await recalc(req.user.id, d);
   broadcast(); res.json({ ok: true });
-});
+}));
 
 // ---------- OVERTIME (employee declares the exact timing, e.g. 9:00 PM - 9:30 PM) ----------
-app.post('/api/overtime', auth, empOnly, (req, res) => {
+app.post('/api/overtime', auth, empOnly, h(async (req, res) => {
   const { start, end } = req.body || {};
   const id = req.user.id, d = today();
   if (!validTime(start) || !validTime(end))
     return res.status(400).json({ error: 'Valid overtime start and end time are required' });
   if (mins(end) <= mins(start))
     return res.status(400).json({ error: 'Overtime end time must be after the start time' });
-  if (onApprovedLeave(id, d))
+  if (await onApprovedLeave(id, d))
     return res.status(400).json({ error: 'You are on leave today, so overtime cannot be added.' });
-  if (!one('SELECT 1 FROM punches WHERE emp_id=? AND date=?', id, d))
+  if (!(await one('SELECT 1 AS x FROM punches WHERE emp_id=? AND date=?', id, d)))
     return res.status(400).json({ error: 'Punch in first. Overtime can only be added on a day you attended.' });
-  const clash = q('SELECT * FROM overtime WHERE emp_id=? AND date=?', id, d)
+
+  // Overtime must be OUTSIDE the regular timing set by the admin (regular hours are paid separately)
+  const emp = (await one('SELECT work_start, work_end FROM employees WHERE id=?', id)) || {};
+  const ws = emp.work_start || '09:00', we = emp.work_end || '17:00';
+  if (shiftOverlapMin(mins(start), mins(end), ws, we) > 0)
+    return res.status(400).json({ error: `Overtime must be outside your regular timing (${ws} - ${we}).` });
+
+  const clash = (await q('SELECT * FROM overtime WHERE emp_id=? AND date=?', id, d))
     .some(o => mins(start) < mins(o.ot_end) && mins(end) > mins(o.ot_start));
   if (clash) return res.status(400).json({ error: 'This overlaps an overtime slot you already added today.' });
-  run('INSERT INTO overtime(emp_id,date,ot_start,ot_end) VALUES(?,?,?,?)', id, d, start, end);
-  recalc(id, d);
+  await run('INSERT INTO overtime(emp_id,date,ot_start,ot_end) VALUES(?,?,?,?)', id, d, start, end);
+  await recalc(id, d);
   broadcast(); res.json({ ok: true });
-});
+}));
 
-// ---------- BREAK (30 min) / LUNCH (1 hr): free up to the allowance, extra is deducted from the day's hours ----------
-app.post('/api/break/start', auth, empOnly, (req, res) => {
+// ---------- BREAK / LUNCH ----------
+app.post('/api/break/start', auth, empOnly, h(async (req, res) => {
   const id = req.user.id, d = today();
   const kind = String((req.body || {}).kind || '').toUpperCase();
   if (!['BREAK', 'LUNCH'].includes(kind)) return res.status(400).json({ error: 'Choose break or lunch' });
-  closeStale(id);
-  if (onApprovedLeave(id, d)) return res.status(400).json({ error: 'You are on leave today.' });
-  if (!one('SELECT 1 FROM punches WHERE emp_id=? AND date=? AND punch_out IS NULL', id, d))
+  await closeStale(id);
+  if (await onApprovedLeave(id, d)) return res.status(400).json({ error: 'You are on leave today.' });
+  if (!(await one('SELECT 1 AS x FROM punches WHERE emp_id=? AND date=? AND punch_out IS NULL', id, d)))
     return res.status(400).json({ error: 'Punch in first. You can take a break only while punched in.' });
-  if (one('SELECT 1 FROM breaks WHERE emp_id=? AND end_ms IS NULL', id))
+  if (await one('SELECT 1 AS x FROM breaks WHERE emp_id=? AND end_ms IS NULL', id))
     return res.status(400).json({ error: 'You are already on a break. End it first.' });
-  run('INSERT INTO breaks(emp_id,date,kind,start_ms) VALUES(?,?,?,?)', id, d, kind, Date.now());
-  recalc(id, d);
+  await run('INSERT INTO breaks(emp_id,date,kind,start_ms) VALUES(?,?,?,?)', id, d, kind, Date.now());
+  await recalc(id, d);
   broadcast(); res.json({ ok: true });
-});
+}));
 
-app.post('/api/break/end', auth, empOnly, (req, res) => {
+app.post('/api/break/end', auth, empOnly, h(async (req, res) => {
   const id = req.user.id;
-  const b = one('SELECT * FROM breaks WHERE emp_id=? AND end_ms IS NULL ORDER BY id DESC', id);
+  const b = await one('SELECT * FROM breaks WHERE emp_id=? AND end_ms IS NULL ORDER BY id DESC', id);
   if (!b) return res.status(400).json({ error: 'You are not on a break.' });
-  run('UPDATE breaks SET end_ms=? WHERE id=?', Date.now(), b.id);
-  recalc(id, b.date);
+  await run('UPDATE breaks SET end_ms=? WHERE id=?', Date.now(), b.id);
+  await recalc(id, b.date);
   broadcast(); res.json({ ok: true });
-});
+}));
 
-// ---------- SUDDEN LEAVE (no application needed - the day becomes LEAVE immediately) ----------
-app.post('/api/leave-today', auth, empOnly, (req, res) => {
+// ---------- SUDDEN LEAVE ----------
+app.post('/api/leave-today', auth, empOnly, h(async (req, res) => {
   const id = req.user.id, d = today();
-  closeStale(id);
-  if (onApprovedLeave(id, d))
+  await closeStale(id);
+  if (await onApprovedLeave(id, d))
     return res.status(400).json({ error: 'You are already on leave today.' });
-  if (one('SELECT 1 FROM punches WHERE emp_id=? AND date=?', id, d))
+  if (await one('SELECT 1 AS x FROM punches WHERE emp_id=? AND date=?', id, d))
     return res.status(400).json({ error: 'You have already punched in today, so you cannot take leave for today.' });
-  // Auto-approved leave record: this makes the kiosk red, blocks punching, and counts in the dashboard
-  run("INSERT INTO leaves(id,emp_id,type,start_date,end_date,reason,status,seen) VALUES(?,?,?,?,?,?,?,1)",
-    'LV-' + Date.now(), id, 'Sudden Leave', d, d, 'Marked on leave by employee (no prior application)', 'APPROVED');
-  // Daily log row with status ON_LEAVE so admin Attendance Logs shows it too
-  run('DELETE FROM attendance WHERE emp_id=? AND date=?', id, d);
-  run('INSERT INTO attendance(id,emp_id,date,clock_in,clock_out,hours,ot,status,punches) VALUES(?,?,?,?,?,?,?,?,?)',
-    'LOG-' + Date.now(), id, d, null, null, 0, 0, 'ON_LEAVE', 0);
+  await run("INSERT INTO leaves(id,emp_id,type,start_date,end_date,reason,status,seen) VALUES(?,?,?,?,?,?,?,1)",
+    newId('LV-'), id, 'Sudden Leave', d, d, 'Marked on leave by employee (no prior application)', 'APPROVED');
+  await run('DELETE FROM attendance WHERE emp_id=? AND date=?', id, d);
+  await run('INSERT INTO attendance(id,emp_id,date,clock_in,clock_out,hours,ot,status,punches) VALUES(?,?,?,?,?,?,?,?,?)',
+    newId('LOG-'), id, d, null, null, 0, 0, 'ON_LEAVE', 0);
   broadcast(); res.json({ ok: true });
-});
+}));
 
 // Admin manual entry: adds one session to that day and sets the chosen status
-app.post('/api/attendance', auth, adminOnly, (req, res) => {
+app.post('/api/attendance', auth, adminOnly, h(async (req, res) => {
   const { empId, date, clockIn, clockOut, status } = req.body || {};
   if (!empId || !date || !validTime(clockIn) || !validTime(clockOut)) return res.status(400).json({ error: 'Employee, date, clock in and clock out are required' });
-  run('INSERT INTO punches(emp_id,date,punch_in,punch_out) VALUES(?,?,?,?)', empId, date, clockIn, clockOut);
-  recalc(empId, date);
-  if (status) run('UPDATE attendance SET status=? WHERE emp_id=? AND date=?', status, empId, date);
+  await run('INSERT INTO punches(emp_id,date,punch_in,punch_out) VALUES(?,?,?,?)', empId, date, clockIn, clockOut);
+  await recalc(empId, date);
+  if (status) await run('UPDATE attendance SET status=? WHERE emp_id=? AND date=?', status, empId, date);
   broadcast(); res.json({ ok: true });
-});
+}));
 
-// Deletes the whole day (punches, overtime and any sudden leave) for that employee
-app.delete('/api/attendance/:id', auth, adminOnly, (req, res) => {
-  const row = one('SELECT * FROM attendance WHERE id=?', req.params.id);
+app.delete('/api/attendance/:id', auth, adminOnly, h(async (req, res) => {
+  const row = await one('SELECT * FROM attendance WHERE id=?', req.params.id);
   if (row) {
-    run('DELETE FROM punches WHERE emp_id=? AND date=?', row.emp_id, row.date);
-    run('DELETE FROM overtime WHERE emp_id=? AND date=?', row.emp_id, row.date);
-    run('DELETE FROM breaks WHERE emp_id=? AND date=?', row.emp_id, row.date);
+    await run('DELETE FROM punches WHERE emp_id=? AND date=?', row.emp_id, row.date);
+    await run('DELETE FROM overtime WHERE emp_id=? AND date=?', row.emp_id, row.date);
+    await run('DELETE FROM breaks WHERE emp_id=? AND date=?', row.emp_id, row.date);
     if (row.status === 'ON_LEAVE')
-      run("DELETE FROM leaves WHERE emp_id=? AND type='Sudden Leave' AND start_date=? AND end_date=?", row.emp_id, row.date, row.date);
+      await run("DELETE FROM leaves WHERE emp_id=? AND type='Sudden Leave' AND start_date=? AND end_date=?", row.emp_id, row.date, row.date);
   }
-  run('DELETE FROM attendance WHERE id=?', req.params.id);
+  await run('DELETE FROM attendance WHERE id=?', req.params.id);
   broadcast(); res.json({ ok: true });
-});
+}));
 
 // ---------- LEAVES ----------
-app.post('/api/leaves', auth, empOnly, (req, res) => {
+app.post('/api/leaves', auth, empOnly, h(async (req, res) => {
   const { type, startDate, endDate, reason } = req.body || {};
   const dateOk = d => /^\d{4}-\d{2}-\d{2}$/.test(d || '');
   if (!type || !dateOk(startDate) || !dateOk(endDate) || !String(reason || '').trim())
     return res.status(400).json({ error: 'Leave type, start date, end date and reason are required' });
   if (endDate < startDate) return res.status(400).json({ error: 'End date cannot be before the start date' });
-  run('INSERT INTO leaves(id,emp_id,type,start_date,end_date,reason) VALUES(?,?,?,?,?,?)',
-    'LV-' + Date.now(), req.user.id, type, startDate, endDate, String(reason).trim());
+  await run('INSERT INTO leaves(id,emp_id,type,start_date,end_date,reason) VALUES(?,?,?,?,?,?)',
+    newId('LV-'), req.user.id, type, startDate, endDate, String(reason).trim());
   broadcast(); res.json({ ok: true });
-});
+}));
 
-// Admin approves / rejects. seen=0 means the employee has not been notified yet.
-app.patch('/api/leaves/:id', auth, adminOnly, (req, res) => {
+app.patch('/api/leaves/:id', auth, adminOnly, h(async (req, res) => {
   const s = (req.body || {}).status;
   if (!['APPROVED', 'REJECTED'].includes(s)) return res.status(400).json({ error: 'Bad status' });
-  run('UPDATE leaves SET status=?, seen=0 WHERE id=?', s, req.params.id);
+  await run('UPDATE leaves SET status=?, seen=0 WHERE id=?', s, req.params.id);
   broadcast(); res.json({ ok: true });
-});
+}));
 
-// Employee closed the notification pop-up
-app.patch('/api/leaves/:id/seen', auth, empOnly, (req, res) => {
-  run('UPDATE leaves SET seen=1 WHERE id=? AND emp_id=?', req.params.id, req.user.id);
+app.patch('/api/leaves/:id/seen', auth, empOnly, h(async (req, res) => {
+  await run('UPDATE leaves SET seen=1 WHERE id=? AND emp_id=?', req.params.id, req.user.id);
   res.json({ ok: true });
-});
+}));
 
-// Open /api/version in the browser to confirm the NEW server.js is the one running
-app.get('/api/version', (req, res) => res.json({ version: '1.6.0', features: ['overtime', 'leave-today', 'break-lunch', 'grace'] }));
+app.get('/api/version', (req, res) => res.json({ version: '1.7.0', db: 'postgres', features: ['overtime', 'leave-today', 'break-lunch', 'grace', 'shift-hours'] }));
 
-// Unknown API route -> readable JSON instead of an HTML 404 page
 app.use('/api', (req, res) => res.status(404).json({
   error: `API route not found: ${req.method} ${req.originalUrl}. The server is running an old server.js - replace it and restart.`
 }));
 
-// Any unexpected server/database error is returned as readable JSON (and logged in the terminal)
 app.use((err, req, res, next) => {
   console.error('Server error:', err);
   res.status(500).json({ error: 'Server error: ' + (err && err.message ? err.message : 'unknown') });
 });
 
-app.listen(PORT, () => console.log(`Attendance system running on port ${PORT} (timezone: ${TZ})`));
+initDb()
+  .then(() => app.listen(PORT, () => console.log(`Attendance system running on port ${PORT} (timezone: ${TZ}, db: postgres)`)))
+  .catch(e => { console.error('Database setup failed:', e); process.exit(1); });

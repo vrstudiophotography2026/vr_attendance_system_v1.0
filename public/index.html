@@ -284,7 +284,7 @@ Today's Live Clock-In Activity Stream
 <button onclick="toggleBreak('BREAK')" id="btn-break" class="bg-amber-500 hover:bg-amber-600 active:scale-95 text-white font-bold py-3 px-4 rounded-xl shadow-md transition flex flex-col items-center justify-center space-y-1 opacity-50 cursor-not-allowed" disabled><i class="fa-solid fa-mug-hot text-lg"></i><span id="btn-break-label" class="text-xs">BREAK (30 MIN)</span></button>
 <button onclick="toggleBreak('LUNCH')" id="btn-lunch" class="bg-orange-600 hover:bg-orange-700 active:scale-95 text-white font-bold py-3 px-4 rounded-xl shadow-md transition flex flex-col items-center justify-center space-y-1 opacity-50 cursor-not-allowed" disabled><i class="fa-solid fa-utensils text-lg"></i><span id="btn-lunch-label" class="text-xs">LUNCH (1 HR)</span></button>
 </div>
-<p class="text-[10px] text-slate-400 text-center">Break 30 min and lunch 1 hr are free. Extra time is deducted from your hours. Overtime counts only when you add its timing.</p>
+<p class="text-[10px] text-slate-400 text-center">Regular hours count only inside your shift timing. Break 30 min and lunch 1 hr are free; extra time is deducted. Overtime counts only the timing you add, outside your shift.</p>
 </div>
 </div>
 
@@ -446,7 +446,7 @@ Today's Live Clock-In Activity Stream
 <button type="button" onclick="closeModal('modal-overtime')" class="text-slate-400 hover:text-white text-lg"><i class="fa-solid fa-xmark"></i></button>
 </div>
 <form id="form-overtime" onsubmit="handleOvertimeSubmit(event)" class="p-6 space-y-4" novalidate>
-<p class="text-xs text-slate-500">Enter the exact time you worked extra today. Only this timing is counted as overtime (paid at your normal hourly rate).</p>
+<p class="text-xs text-slate-500">Enter the exact time you worked extra today (outside your regular shift). Only this timing is counted as overtime, paid at your normal hourly rate.</p>
 <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
 <div><label class="block text-xs font-bold text-slate-700 uppercase mb-1">Overtime From</label><div id="ot-form-start"></div></div>
 <div><label class="block text-xs font-bold text-slate-700 uppercase mb-1">Overtime To</label><div id="ot-form-end"></div></div>
@@ -508,7 +508,7 @@ Today's Live Clock-In Activity Stream
 <div class="bg-slate-900 text-white p-4 rounded-xl flex justify-between items-center mt-6">
 <div>
 <div class="text-xs uppercase tracking-widest text-slate-400 font-bold">Total Salary</div>
-<div class="text-[10px] text-slate-400">Hours worked x hourly rate</div>
+<div class="text-[10px] text-slate-400">Shift hours + overtime hours x hourly rate</div>
 </div>
 <div id="payslip-net-pay" class="text-2xl font-black text-emerald-400"></div>
 </div>
@@ -871,8 +871,8 @@ function renderLeaveRequests() {
 }
 
 // ===== Payroll =====
-// Salary = hours actually worked x hourly rate (even 5 minutes is paid).
-// Overtime hours are paid at the SAME hourly rate as regular hours. No deductions.
+// Regular hours = punched time inside the admin-set shift (calculated by the server).
+// Overtime = only the timing the employee declared, paid at the SAME hourly rate. No deductions.
 function calcPay(emp, month) {
   const logs = db.attendanceLogs.filter(l => l.empId === emp.id && l.date.startsWith(month));
   const ot = logs.reduce((a, c) => a + (c.overtimeHours || 0), 0);
