@@ -1,13 +1,17 @@
 {
   "name": "vr-attendance-system",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "express": "^4.19.2",
-    "jsonwebtoken": "^9.0.2",
-    "pg": "^8.11.3"
+    "firebase-admin": "^14.5.0",
+    "jsonwebtoken": "^9.0.2"
   }
 }

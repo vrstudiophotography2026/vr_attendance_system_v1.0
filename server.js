@@ -1,11 +1,9 @@
 const express = require('express');
-const { Pool, types } = require('pg');
+const { initializeApp, cert } = require('firebase-admin/app');
+const { getDatabase } = require('firebase-admin/database');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
-
-// Postgres returns BIGINT as string; we want numbers (used for break timestamps)
-types.setTypeParser(20, v => parseInt(v, 10));
 
 const SECRET = process.env.JWT_SECRET || 'change-this-secret-in-production';
 // Late rule: LATE only if the first punch-in is MORE than GRACE_MIN minutes after the employee's own shift start
@@ -18,10 +16,46 @@ const LUNCH_ALLOWED_MIN = 60;
 const TZ = process.env.APP_TZ || 'Asia/Kolkata';
 const PORT = process.env.PORT || 3000;
 
-if (!process.env.DATABASE_URL) {
-  console.error('DATABASE_URL is not set. Create a free Postgres database (e.g. Neon) and set DATABASE_URL.');
+// ---------- FIREBASE REALTIME DATABASE ----------
+const DB_URL = process.env.FIREBASE_DB_URL || 'https://attendance-system-bc0dd-default-rtdb.firebaseio.com';
+function loadServiceAccount() {
+  const raw = (process.env.FIREBASE_SERVICE_ACCOUNT || '').trim();
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw.startsWith('{') ? raw : Buffer.from(raw, 'base64').toString('utf8'));
+  } catch (e) {
+    console.error('FIREBASE_SERVICE_ACCOUNT is not valid JSON (or base64 JSON):', e.message);
+    return null;
+  }
+}
+const serviceAccount = loadServiceAccount();
+if (!serviceAccount) {
+  console.error('Missing FIREBASE_SERVICE_ACCOUNT. Firebase console > Project settings > Service accounts > Generate new private key, then paste the whole JSON into this environment variable.');
   process.exit(1);
 }
+initializeApp({ credential: cert(serviceAccount), databaseURL: DB_URL });
+const rdb = getDatabase();
+
+const get = async p => (await rdb.ref(p).get()).val();
+const set = (p, v) => rdb.ref(p).set(v);
+const update = (p, v) => rdb.ref(p).update(v);
+const remove = p => rdb.ref(p).remove();
+const push = async (p, v) => { const r = rdb.ref(p).push(); await r.set(v); return r.key; };
+
+// Wrap async routes so errors go to the error handler instead of hanging
+const h = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+// ---------- DATA LAYOUT ----------
+// admins/{key}                    { username, passwordHash }
+// employees/{empId}               { name, passwordHash, dept, role, hourlyRate, workStart, workEnd, joined }
+// attendance/{empId}/{date}       daily summary row
+// punches/{empId}/{date}/{id}     { in, out }
+// overtime/{empId}/{date}/{id}    { start, end }
+// breaks/{empId}/{date}/{id}      { kind, start, end }   (start/end are epoch ms)
+// leaves/{id}                     { empId, type, startDate, endDate, reason, status, seen, seq }
+
+const encKey = s => encodeURIComponent(String(s)).replace(/\./g, '%2E');
+const okKey = s => /^[A-Za-z0-9_-]+$/.test(s);
 
 const tzParts = () => {
   const p = {};
@@ -38,58 +72,15 @@ const app = express();
 app.use(express.json());
 app.use(express.static('public', { etag: false, setHeaders: res => res.set('Cache-Control', 'no-store') }));
 
-// ---------- DATABASE (PostgreSQL - data survives redeploys) ----------
-const isLocal = /localhost|127\.0\.0\.1/.test(process.env.DATABASE_URL);
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: isLocal ? false : { rejectUnauthorized: false }
-});
-pool.on('error', e => console.error('DB pool error:', e.message));
-
-// Keep the "?" placeholders used below: convert to $1, $2 ...
-const toPg = s => { let i = 0; return s.replace(/\?/g, () => '$' + (++i)); };
-const q = async (s, ...a) => (await pool.query(toPg(s), a)).rows;
-const one = async (s, ...a) => (await q(s, ...a))[0];
-const run = (s, ...a) => pool.query(toPg(s), a);
-
-// Wrap async routes so errors go to the error handler instead of hanging
-const h = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
-
-async function initDb() {
-  await pool.query(`
-CREATE TABLE IF NOT EXISTS admins(username TEXT PRIMARY KEY, password_hash TEXT);
-CREATE TABLE IF NOT EXISTS employees(
-  id TEXT PRIMARY KEY, name TEXT, password_hash TEXT,
-  dept TEXT DEFAULT 'Staff', role TEXT, hourly_rate DOUBLE PRECISION,
-  work_start TEXT DEFAULT '09:00', work_end TEXT DEFAULT '17:00', joined TEXT);
-CREATE TABLE IF NOT EXISTS attendance(
-  id TEXT PRIMARY KEY, seq BIGSERIAL, emp_id TEXT, date TEXT, clock_in TEXT, clock_out TEXT,
-  hours DOUBLE PRECISION DEFAULT 0, ot DOUBLE PRECISION DEFAULT 0, status TEXT, punches INTEGER DEFAULT 0,
-  break_min DOUBLE PRECISION DEFAULT 0, lunch_min DOUBLE PRECISION DEFAULT 0, deduct DOUBLE PRECISION DEFAULT 0);
-CREATE TABLE IF NOT EXISTS punches(
-  id SERIAL PRIMARY KEY, emp_id TEXT, date TEXT, punch_in TEXT, punch_out TEXT);
-CREATE TABLE IF NOT EXISTS overtime(
-  id SERIAL PRIMARY KEY, emp_id TEXT, date TEXT, ot_start TEXT, ot_end TEXT);
-CREATE TABLE IF NOT EXISTS breaks(
-  id SERIAL PRIMARY KEY, emp_id TEXT, date TEXT, kind TEXT, start_ms BIGINT, end_ms BIGINT);
-CREATE TABLE IF NOT EXISTS leaves(
-  id TEXT PRIMARY KEY, seq BIGSERIAL, emp_id TEXT, type TEXT, start_date TEXT, end_date TEXT,
-  reason TEXT, status TEXT DEFAULT 'PENDING', seen INTEGER DEFAULT 0);
-CREATE INDEX IF NOT EXISTS idx_att_emp_date ON attendance(emp_id, date);
-CREATE INDEX IF NOT EXISTS idx_punch_emp_date ON punches(emp_id, date);
-`);
-  if (!(await one('SELECT 1 FROM admins'))) {
-    // Set ADMIN_USER / ADMIN_PASS in Render env vars (defaults kept so existing login keeps working)
-    const user = process.env.ADMIN_USER || 'admin@vr';
-    const pass = process.env.ADMIN_PASS || 'RojaRaj@1721';
-    await run('INSERT INTO admins VALUES(?,?)', user, bcrypt.hashSync(pass, 10));
-  }
-}
+// Reject ids with characters Firebase does not allow in keys
+app.param('id', (req, res, next, v) => okKey(v) ? next() : res.status(400).json({ error: 'Bad id' }));
 
 const mins = t => { const [hh, m] = t.split(':'); return hh * 60 + +m; };
 const hoursBetween = (i, o) => { let x = (mins(o) - mins(i)) / 60; if (x < 0) x += 24; return x; };
 const overlap = (a1, a2, b1, b2) => Math.max(0, Math.min(a2, b2) - Math.max(a1, b1));
 const newId = prefix => prefix + Date.now() + '-' + crypto.randomBytes(3).toString('hex');
+const validTime = t => /^([01]\d|2[0-3]):[0-5]\d$/.test(t || '');
+const validDate = d => /^\d{4}-\d{2}-\d{2}$/.test(d || '');
 
 // Minutes of [a,b] (24h minutes) that fall inside the shift [ws,we] (handles overnight shifts)
 function shiftOverlapMin(a, b, ws, we) {
@@ -99,28 +90,32 @@ function shiftOverlapMin(a, b, ws, we) {
   return overlap(a, b, s, e) + overlap(a + 1440, b + 1440, s, e);
 }
 
-// Row -> shape the frontend understands
-const E = r => ({
-  id: r.id, name: r.name, dept: r.dept, role: r.role, hourlyRate: r.hourly_rate,
-  workStart: r.work_start || '09:00', workEnd: r.work_end || '17:00', joined: r.joined || null
+// {key: value} -> [{key, ...value}]
+const toList = o => o ? Object.entries(o).map(([key, v]) => ({ key, ...v })) : [];
+// emp/date/key tree -> flat list with empId + date
+const flatTree = tree => {
+  const out = [];
+  Object.entries(tree || {}).forEach(([empId, days]) =>
+    Object.entries(days || {}).forEach(([date, items]) =>
+      Object.entries(items || {}).forEach(([key, v]) => out.push({ empId, date, key, ...v }))));
+  return out;
+};
+const dayList = async (kind, empId, date) => toList(await get(`${kind}/${empId}/${date}`));
+
+// Row -> shape the frontend understands (times are stored/sent as 24h "HH:MM", the UI shows 12h)
+const E = (id, r) => ({
+  id, name: r.name, dept: r.dept || 'Staff', role: r.role, hourlyRate: r.hourlyRate,
+  workStart: r.workStart || '09:00', workEnd: r.workEnd || '17:00', joined: r.joined || null
 });
-const L = (r, sess, ots, brs) => ({
-  id: r.id, empId: r.emp_id, date: r.date, clockIn: r.clock_in, clockOut: r.clock_out,
-  hoursWorked: r.hours, overtimeHours: r.ot, status: r.status, punches: r.punches || 0,
-  sessions: sess[r.emp_id + '|' + r.date] || [],
-  overtimeSlots: ots[r.emp_id + '|' + r.date] || [],
-  breakMinutes: r.break_min || 0, lunchMinutes: r.lunch_min || 0, deductedHours: r.deduct || 0,
-  breakSlots: brs[r.emp_id + '|' + r.date] || []
-});
-const V = r => ({
-  id: r.id, empId: r.emp_id, type: r.type, startDate: r.start_date, endDate: r.end_date,
+const V = (id, r) => ({
+  id, empId: r.empId, type: r.type, startDate: r.startDate, endDate: r.endDate,
   reason: r.reason, status: r.status, seen: !!r.seen
 });
 
-// ---------- REALTIME (Server-Sent Events) ----------
+// ---------- REALTIME (Server-Sent Events to the browser) ----------
 const clients = new Set();
 const broadcast = () => clients.forEach(r => r.write('data: change\n\n'));
-setInterval(() => clients.forEach(r => r.write(': ping\n\n')), 25000); // keeps the stream alive behind proxies
+setInterval(() => clients.forEach(r => r.write(': ping\n\n')), 25000);
 
 // ---------- AUTH ----------
 function auth(req, res, next) {
@@ -137,16 +132,22 @@ app.post('/api/login', h(async (req, res) => {
   const { as, username, password } = req.body || {};
   const bad = () => res.status(401).json({ error: 'Invalid username or password' });
   if (as === 'admin') {
-    const a = await one('SELECT * FROM admins WHERE username=?', String(username || ''));
-    if (!a || !bcrypt.compareSync(password || '', a.password_hash)) return bad();
+    const a = await get('admins/' + encKey(username || ''));
+    if (!a || !bcrypt.compareSync(password || '', a.passwordHash || '')) return bad();
     return res.json({ token: jwt.sign({ role: 'admin' }, SECRET, { expiresIn: '8h' }) });
   }
-  const e = await one('SELECT * FROM employees WHERE id=?', String(as || ''));
-  if (!e || !bcrypt.compareSync(password || '', e.password_hash || '')) return res.status(401).json({ error: 'Incorrect password' });
-  res.json({ token: jwt.sign({ role: 'employee', id: e.id }, SECRET, { expiresIn: '8h' }) });
+  const id = String(as || '');
+  const e = okKey(id) ? await get('employees/' + id) : null;
+  if (!e || !bcrypt.compareSync(password || '', e.passwordHash || '')) return res.status(401).json({ error: 'Incorrect password' });
+  res.json({ token: jwt.sign({ role: 'employee', id }, SECRET, { expiresIn: '8h' }) });
 }));
 
-app.get('/api/public/employees', h(async (req, res) => res.json(await q('SELECT id,name FROM employees ORDER BY id'))));
+// Names only (no secrets) so the "Mode" dropdown can list staff
+app.get('/api/public/employees', h(async (req, res) => {
+  const list = toList(await get('employees')).map(e => ({ id: e.key, name: e.name }));
+  list.sort((x, y) => (x.id < y.id ? -1 : 1));
+  res.json(list);
+}));
 
 app.get('/api/events', auth, (req, res) => {
   res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
@@ -155,32 +156,58 @@ app.get('/api/events', auth, (req, res) => {
   req.on('close', () => clients.delete(res));
 });
 
+// Admin gets everything, employee gets only own records
 app.get('/api/data', auth, h(async (req, res) => {
   const a = req.user.role === 'admin', id = req.user.id;
-  const punchRows = a ? await q('SELECT * FROM punches ORDER BY punch_in, id') : await q('SELECT * FROM punches WHERE emp_id=? ORDER BY punch_in, id', id);
+  const sub = async kind => a ? await get(kind) : { [id]: await get(`${kind}/${id}`) };
+
   const sess = {};
-  punchRows.forEach(p => (sess[p.emp_id + '|' + p.date] ||= []).push({ in: p.punch_in, out: p.punch_out }));
-  const otRows = a ? await q('SELECT * FROM overtime ORDER BY ot_start, id') : await q('SELECT * FROM overtime WHERE emp_id=? ORDER BY ot_start, id', id);
+  flatTree(await sub('punches'))
+    .sort((x, y) => (x.in < y.in ? -1 : x.in > y.in ? 1 : x.key < y.key ? -1 : 1))
+    .forEach(p => (sess[p.empId + '|' + p.date] ||= []).push({ in: p.in, out: p.out || null }));
+
   const ots = {};
-  otRows.forEach(o => (ots[o.emp_id + '|' + o.date] ||= []).push({ start: o.ot_start, end: o.ot_end, hours: hoursBetween(o.ot_start, o.ot_end) }));
-  const brRows = a ? await q('SELECT * FROM breaks ORDER BY start_ms, id') : await q('SELECT * FROM breaks WHERE emp_id=? ORDER BY start_ms, id', id);
+  flatTree(await sub('overtime'))
+    .sort((x, y) => (x.start < y.start ? -1 : 1))
+    .forEach(o => (ots[o.empId + '|' + o.date] ||= []).push({ start: o.start, end: o.end, hours: hoursBetween(o.start, o.end) }));
+
   const brs = {};
-  brRows.forEach(b => (brs[b.emp_id + '|' + b.date] ||= []).push({ kind: b.kind, start: b.start_ms, end: b.end_ms }));
-  const emps = a ? await q('SELECT * FROM employees ORDER BY id') : await q('SELECT * FROM employees WHERE id=?', id);
-  const logs = a ? await q('SELECT * FROM attendance ORDER BY date DESC, seq DESC') : await q('SELECT * FROM attendance WHERE emp_id=? ORDER BY date DESC, seq DESC', id);
-  const leaves = a ? await q('SELECT * FROM leaves ORDER BY seq DESC') : await q('SELECT * FROM leaves WHERE emp_id=? ORDER BY seq DESC', id);
+  flatTree(await sub('breaks'))
+    .sort((x, y) => x.start - y.start)
+    .forEach(b => (brs[b.empId + '|' + b.date] ||= []).push({ kind: b.kind, start: b.start, end: b.end || null }));
+
+  const empTree = a ? await get('employees') : { [id]: await get('employees/' + id) };
+  const employees = Object.entries(empTree || {}).filter(([, v]) => v).map(([k, v]) => E(k, v))
+    .sort((x, y) => (x.id < y.id ? -1 : 1));
+
+  const attendanceLogs = [];
+  Object.entries((await sub('attendance')) || {}).forEach(([empId, days]) =>
+    Object.entries(days || {}).forEach(([date, r]) => {
+      const k = empId + '|' + date;
+      attendanceLogs.push({
+        id: `${empId}__${date}`, empId, date, clockIn: r.clockIn || null, clockOut: r.clockOut || null,
+        hoursWorked: r.hours || 0, overtimeHours: r.ot || 0, status: r.status, punches: r.punches || 0,
+        sessions: sess[k] || [], overtimeSlots: ots[k] || [],
+        breakMinutes: r.breakMin || 0, lunchMinutes: r.lunchMin || 0, deductedHours: r.deduct || 0,
+        breakSlots: brs[k] || [], _seq: r.seq || 0
+      });
+    }));
+  attendanceLogs.sort((x, y) => (x.date < y.date ? 1 : x.date > y.date ? -1 : y._seq - x._seq));
+  attendanceLogs.forEach(l => delete l._seq);
+
+  const leaveRequests = toList(await get('leaves'))
+    .filter(r => a || r.empId === id)
+    .sort((x, y) => (y.seq || 0) - (x.seq || 0))
+    .map(r => V(r.key, r));
+
   res.json({
-    employees: emps.map(E),
-    attendanceLogs: logs.map(r => L(r, sess, ots, brs)),
-    leaveRequests: leaves.map(V),
+    employees, attendanceLogs, leaveRequests,
     config: { graceMin: GRACE_MIN, breakMin: BREAK_ALLOWED_MIN, lunchMin: LUNCH_ALLOWED_MIN },
     serverNow: Date.now()
   });
 }));
 
 // ---------- EMPLOYEES (admin) ----------
-const validTime = t => /^([01]\d|2[0-3]):[0-5]\d$/.test(t || '');
-
 function checkEmployee(body, needPassword) {
   const b = body || {};
   const name = String(b.name || '').trim();
@@ -199,119 +226,136 @@ function checkEmployee(body, needPassword) {
 app.post('/api/employees', auth, adminOnly, h(async (req, res) => {
   const v = checkEmployee(req.body, true);
   if (v.error) return res.status(400).json({ error: v.error });
-  const m = (await one("SELECT MAX(CAST(SUBSTR(id,5) AS INTEGER)) AS m FROM employees")).m;
-  const id = 'EMP-' + ((m || 100) + 1);
-  await run('INSERT INTO employees(id,name,password_hash,role,hourly_rate,work_start,work_end,joined) VALUES(?,?,?,?,?,?,?,?)',
-    id, v.name, bcrypt.hashSync(v.password, 10), v.role, v.hourlyRate, v.workStart, v.workEnd, today());
+  const keys = Object.keys((await get('employees')) || {});
+  const maxNum = keys.reduce((m, k) => Math.max(m, parseInt(k.slice(4), 10) || 0), 100);
+  const id = 'EMP-' + (maxNum + 1);
+  await set('employees/' + id, {
+    name: v.name, passwordHash: bcrypt.hashSync(v.password, 10), dept: 'Staff', role: v.role,
+    hourlyRate: v.hourlyRate, workStart: v.workStart, workEnd: v.workEnd, joined: today()
+  });
   broadcast(); res.json({ ok: true });
 }));
 
 app.put('/api/employees/:id', auth, adminOnly, h(async (req, res) => {
   const v = checkEmployee(req.body, false);
   if (v.error) return res.status(400).json({ error: v.error });
-  await run('UPDATE employees SET name=?, role=?, hourly_rate=?, work_start=?, work_end=? WHERE id=?',
-    v.name, v.role, v.hourlyRate, v.workStart, v.workEnd, req.params.id);
-  if (v.password) await run('UPDATE employees SET password_hash=? WHERE id=?', bcrypt.hashSync(v.password, 10), req.params.id);
+  const id = req.params.id;
+  if (!(await get('employees/' + id))) return res.status(404).json({ error: 'Employee not found' });
+  const upd = { name: v.name, role: v.role, hourlyRate: v.hourlyRate, workStart: v.workStart, workEnd: v.workEnd };
+  if (v.password) upd.passwordHash = bcrypt.hashSync(v.password, 10);
+  await update('employees/' + id, upd);
   broadcast(); res.json({ ok: true });
 }));
 
 app.delete('/api/employees/:id', auth, adminOnly, h(async (req, res) => {
   const id = req.params.id;
-  await run('DELETE FROM punches WHERE emp_id=?', id);
-  await run('DELETE FROM overtime WHERE emp_id=?', id);
-  await run('DELETE FROM breaks WHERE emp_id=?', id);
-  await run('DELETE FROM attendance WHERE emp_id=?', id);
-  await run('DELETE FROM leaves WHERE emp_id=?', id);
-  await run('DELETE FROM employees WHERE id=?', id);
+  await Promise.all(['punches', 'overtime', 'breaks', 'attendance', 'employees'].map(k => remove(`${k}/${id}`)));
+  for (const l of toList(await get('leaves')).filter(l => l.empId === id)) await remove('leaves/' + l.key);
   broadcast(); res.json({ ok: true });
 }));
 
-// ---------- ATTENDANCE ----------
+// ---------- ATTENDANCE (multiple punch sessions per day) ----------
 
 // Rebuild the daily summary row from that day's punches.
 // - Regular hours = ONLY the punched time that falls inside the admin-set work timing (start-end),
 //   minus break / lunch time that went over the allowance.
-// - Overtime = ONLY the exact timing the employee declared (e.g. 9:00 PM - 9:30 PM). Never automatic,
-//   and never overlaps the shift, so nothing is paid twice.
+// - Overtime = ONLY the exact timing the employee declared. Never automatic, never inside the shift.
 // - LATE only if the first punch-in is later than the shift start + GRACE_MIN minutes.
 async function recalc(empId, date) {
-  const ps = await q('SELECT * FROM punches WHERE emp_id=? AND date=? ORDER BY punch_in, id', empId, date);
-  const ex = await one('SELECT id FROM attendance WHERE emp_id=? AND date=?', empId, date);
-  if (!ps.length) { if (ex) await run('DELETE FROM attendance WHERE id=?', ex.id); return; }
+  const ps = (await dayList('punches', empId, date))
+    .sort((x, y) => (x.in < y.in ? -1 : x.in > y.in ? 1 : x.key < y.key ? -1 : 1));
+  const attPath = `attendance/${empId}/${date}`;
+  if (!ps.length) { await remove(attPath); return; }
 
-  const emp = (await one('SELECT work_start, work_end FROM employees WHERE id=?', empId)) || {};
-  const ws = emp.work_start || '09:00', we = emp.work_end || '17:00';
+  const emp = (await get('employees/' + empId)) || {};
+  const ws = emp.workStart || '09:00', we = emp.workEnd || '17:00';
 
-  // Regular minutes = punched time inside the shift window
-  const regMin = ps.reduce((a, p) => a + (p.punch_out ? shiftOverlapMin(mins(p.punch_in), mins(p.punch_out), ws, we) : 0), 0);
+  const regMin = ps.reduce((a, p) => a + (p.out ? shiftOverlapMin(mins(p.in), mins(p.out), ws, we) : 0), 0);
   const gross = regMin / 60;
 
   const now = Date.now();
   let brk = 0, lun = 0;
-  (await q('SELECT * FROM breaks WHERE emp_id=? AND date=?', empId, date)).forEach(b => {
-    const m = Math.max(0, ((b.end_ms || now) - b.start_ms) / 60000);
+  (await dayList('breaks', empId, date)).forEach(b => {
+    const m = Math.max(0, ((b.end || now) - b.start) / 60000);
     if (b.kind === 'LUNCH') lun += m; else brk += m;
   });
   const deduct = (Math.max(0, brk - BREAK_ALLOWED_MIN) + Math.max(0, lun - LUNCH_ALLOWED_MIN)) / 60;
   const hours = Math.max(0, gross - deduct);
 
-  const ot = (await q('SELECT * FROM overtime WHERE emp_id=? AND date=?', empId, date))
-    .reduce((a, o) => a + hoursBetween(o.ot_start, o.ot_end), 0);
-  const first = ps[0].punch_in, last = ps[ps.length - 1];
-  const out = last.punch_out || null;
-  const count = ps.length + ps.filter(p => p.punch_out).length;
+  const ot = (await dayList('overtime', empId, date)).reduce((a, o) => a + hoursBetween(o.start, o.end), 0);
+  const first = ps[0].in, last = ps[ps.length - 1];
+  const out = last.out || null;                               // null = currently punched in
+  const count = ps.length + ps.filter(p => p.out).length;     // every IN and every OUT
   const status = mins(first) > mins(ws) + GRACE_MIN ? 'LATE' : 'PRESENT';
-  if (ex) await run('UPDATE attendance SET clock_in=?, clock_out=?, hours=?, ot=?, punches=?, status=?, break_min=?, lunch_min=?, deduct=? WHERE id=?',
-    first, out, hours, ot, count, status, brk, lun, deduct, ex.id);
-  else await run('INSERT INTO attendance(id,emp_id,date,clock_in,clock_out,hours,ot,status,punches,break_min,lunch_min,deduct) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-    newId('LOG-'), empId, date, first, out, hours, ot, status, count, brk, lun, deduct);
+
+  const prev = await get(attPath);
+  await set(attPath, {
+    id: `${empId}__${date}`, empId, date, clockIn: first, clockOut: out, hours, ot, status, punches: count,
+    breakMin: brk, lunchMin: lun, deduct, seq: (prev && prev.seq) || Date.now()
+  });
 }
 
 async function closeBreaks(empId, date, atMs) {
-  await run('UPDATE breaks SET end_ms=? WHERE emp_id=? AND date=? AND end_ms IS NULL', atMs, empId, date);
+  for (const b of (await dayList('breaks', empId, date)).filter(b => !b.end))
+    await update(`breaks/${empId}/${date}/${b.key}`, { end: atMs });
 }
 
-// Sessions left open on an earlier day are closed at 23:59 so nobody gets locked out
+// Sessions / breaks left open on an earlier day are closed so nobody gets locked out
 async function closeStale(empId) {
   const t = today();
-  for (const b of await q('SELECT * FROM breaks WHERE emp_id=? AND end_ms IS NULL AND date<>?', empId, t)) {
-    await run('UPDATE breaks SET end_ms=? WHERE id=?', b.start_ms + (b.kind === 'LUNCH' ? LUNCH_ALLOWED_MIN : BREAK_ALLOWED_MIN) * 60000, b.id);
-    await recalc(b.emp_id, b.date);
+  const brTree = (await get('breaks/' + empId)) || {};
+  for (const [date, items] of Object.entries(brTree)) {
+    if (date === t) continue;
+    let changed = false;
+    for (const [key, b] of Object.entries(items || {})) {
+      if (b.end) continue;
+      await update(`breaks/${empId}/${date}/${key}`, { end: b.start + (b.kind === 'LUNCH' ? LUNCH_ALLOWED_MIN : BREAK_ALLOWED_MIN) * 60000 });
+      changed = true;
+    }
+    if (changed) await recalc(empId, date);
   }
-  const stale = await q('SELECT * FROM punches WHERE emp_id=? AND punch_out IS NULL AND date<>?', empId, t);
-  for (const p of stale) {
-    await run('UPDATE punches SET punch_out=? WHERE id=?', '23:59', p.id);
-    await recalc(p.emp_id, p.date);
+  let staleCount = 0;
+  const pTree = (await get('punches/' + empId)) || {};
+  for (const [date, items] of Object.entries(pTree)) {
+    if (date === t) continue;
+    let changed = false;
+    for (const [key, p] of Object.entries(items || {})) {
+      if (p.out) continue;
+      await update(`punches/${empId}/${date}/${key}`, { out: '23:59' });
+      changed = true; staleCount++;
+    }
+    if (changed) await recalc(empId, date);
   }
-  return stale.length;
+  return staleCount;
 }
 
-const onApprovedLeave = (empId, d) =>
-  one("SELECT 1 AS x FROM leaves WHERE emp_id=? AND status='APPROVED' AND start_date<=? AND end_date>=?", empId, d, d);
+const onApprovedLeave = async (empId, d) =>
+  toList(await get('leaves')).some(r => r.empId === empId && r.status === 'APPROVED' && r.startDate <= d && r.endDate >= d);
 
 app.post('/api/clock-in', auth, empOnly, h(async (req, res) => {
-  const d = today();
-  await closeStale(req.user.id);
-  if (await onApprovedLeave(req.user.id, d))
+  const id = req.user.id, d = today();
+  if (!(await get('employees/' + id))) return res.status(403).json({ error: 'Employee not found' });
+  await closeStale(id);
+  if (await onApprovedLeave(id, d))
     return res.status(400).json({ error: 'You are on leave today, so you cannot punch in.' });
-  if (await one('SELECT 1 AS x FROM punches WHERE emp_id=? AND date=? AND punch_out IS NULL', req.user.id, d))
+  if ((await dayList('punches', id, d)).some(p => !p.out))
     return res.status(400).json({ error: 'You are already punched in. Punch out first.' });
-  await run('INSERT INTO punches(emp_id,date,punch_in) VALUES(?,?,?)', req.user.id, d, nowHM());
-  await recalc(req.user.id, d);
+  await push(`punches/${id}/${d}`, { in: nowHM() });
+  await recalc(id, d);
   broadcast(); res.json({ ok: true });
 }));
 
 app.post('/api/clock-out', auth, empOnly, h(async (req, res) => {
-  const d = today();
-  const staleClosed = await closeStale(req.user.id);
-  const open = await one('SELECT id FROM punches WHERE emp_id=? AND date=? AND punch_out IS NULL ORDER BY id DESC', req.user.id, d);
+  const id = req.user.id, d = today();
+  const staleClosed = await closeStale(id);
+  const open = (await dayList('punches', id, d)).filter(p => !p.out).pop();
   if (!open) {
     if (staleClosed) { broadcast(); return res.json({ ok: true, note: 'Previous open session closed' }); }
     return res.status(400).json({ error: 'You are not punched in.' });
   }
-  await closeBreaks(req.user.id, d, Date.now());
-  await run('UPDATE punches SET punch_out=? WHERE id=?', nowHM(), open.id);
-  await recalc(req.user.id, d);
+  await closeBreaks(id, d, Date.now());                       // punching out ends a running break / lunch
+  await update(`punches/${id}/${d}/${open.key}`, { out: nowHM() });
+  await recalc(id, d);
   broadcast(); res.json({ ok: true });
 }));
 
@@ -325,112 +369,123 @@ app.post('/api/overtime', auth, empOnly, h(async (req, res) => {
     return res.status(400).json({ error: 'Overtime end time must be after the start time' });
   if (await onApprovedLeave(id, d))
     return res.status(400).json({ error: 'You are on leave today, so overtime cannot be added.' });
-  if (!(await one('SELECT 1 AS x FROM punches WHERE emp_id=? AND date=?', id, d)))
+  if (!(await dayList('punches', id, d)).length)
     return res.status(400).json({ error: 'Punch in first. Overtime can only be added on a day you attended.' });
 
   // Overtime must be OUTSIDE the regular timing set by the admin (regular hours are paid separately)
-  const emp = (await one('SELECT work_start, work_end FROM employees WHERE id=?', id)) || {};
-  const ws = emp.work_start || '09:00', we = emp.work_end || '17:00';
+  const emp = (await get('employees/' + id)) || {};
+  const ws = emp.workStart || '09:00', we = emp.workEnd || '17:00';
   if (shiftOverlapMin(mins(start), mins(end), ws, we) > 0)
     return res.status(400).json({ error: `Overtime must be outside your regular timing (${ws} - ${we}).` });
 
-  const clash = (await q('SELECT * FROM overtime WHERE emp_id=? AND date=?', id, d))
-    .some(o => mins(start) < mins(o.ot_end) && mins(end) > mins(o.ot_start));
+  const clash = (await dayList('overtime', id, d)).some(o => mins(start) < mins(o.end) && mins(end) > mins(o.start));
   if (clash) return res.status(400).json({ error: 'This overlaps an overtime slot you already added today.' });
-  await run('INSERT INTO overtime(emp_id,date,ot_start,ot_end) VALUES(?,?,?,?)', id, d, start, end);
+  await push(`overtime/${id}/${d}`, { start, end });
   await recalc(id, d);
   broadcast(); res.json({ ok: true });
 }));
 
-// ---------- BREAK / LUNCH ----------
+// ---------- BREAK (30 min) / LUNCH (1 hr) ----------
 app.post('/api/break/start', auth, empOnly, h(async (req, res) => {
   const id = req.user.id, d = today();
   const kind = String((req.body || {}).kind || '').toUpperCase();
   if (!['BREAK', 'LUNCH'].includes(kind)) return res.status(400).json({ error: 'Choose break or lunch' });
   await closeStale(id);
   if (await onApprovedLeave(id, d)) return res.status(400).json({ error: 'You are on leave today.' });
-  if (!(await one('SELECT 1 AS x FROM punches WHERE emp_id=? AND date=? AND punch_out IS NULL', id, d)))
+  if (!(await dayList('punches', id, d)).some(p => !p.out))
     return res.status(400).json({ error: 'Punch in first. You can take a break only while punched in.' });
-  if (await one('SELECT 1 AS x FROM breaks WHERE emp_id=? AND end_ms IS NULL', id))
+  if ((await dayList('breaks', id, d)).some(b => !b.end))
     return res.status(400).json({ error: 'You are already on a break. End it first.' });
-  await run('INSERT INTO breaks(emp_id,date,kind,start_ms) VALUES(?,?,?,?)', id, d, kind, Date.now());
+  await push(`breaks/${id}/${d}`, { kind, start: Date.now() });
   await recalc(id, d);
   broadcast(); res.json({ ok: true });
 }));
 
 app.post('/api/break/end', auth, empOnly, h(async (req, res) => {
   const id = req.user.id;
-  const b = await one('SELECT * FROM breaks WHERE emp_id=? AND end_ms IS NULL ORDER BY id DESC', id);
-  if (!b) return res.status(400).json({ error: 'You are not on a break.' });
-  await run('UPDATE breaks SET end_ms=? WHERE id=?', Date.now(), b.id);
-  await recalc(id, b.date);
+  const open = flatTree({ [id]: await get('breaks/' + id) }).filter(b => !b.end).pop();
+  if (!open) return res.status(400).json({ error: 'You are not on a break.' });
+  await update(`breaks/${id}/${open.date}/${open.key}`, { end: Date.now() });
+  await recalc(id, open.date);
   broadcast(); res.json({ ok: true });
 }));
 
-// ---------- SUDDEN LEAVE ----------
+// ---------- SUDDEN LEAVE (no application needed - the day becomes LEAVE immediately) ----------
 app.post('/api/leave-today', auth, empOnly, h(async (req, res) => {
   const id = req.user.id, d = today();
   await closeStale(id);
   if (await onApprovedLeave(id, d))
     return res.status(400).json({ error: 'You are already on leave today.' });
-  if (await one('SELECT 1 AS x FROM punches WHERE emp_id=? AND date=?', id, d))
+  if ((await dayList('punches', id, d)).length)
     return res.status(400).json({ error: 'You have already punched in today, so you cannot take leave for today.' });
-  await run("INSERT INTO leaves(id,emp_id,type,start_date,end_date,reason,status,seen) VALUES(?,?,?,?,?,?,?,1)",
-    newId('LV-'), id, 'Sudden Leave', d, d, 'Marked on leave by employee (no prior application)', 'APPROVED');
-  await run('DELETE FROM attendance WHERE emp_id=? AND date=?', id, d);
-  await run('INSERT INTO attendance(id,emp_id,date,clock_in,clock_out,hours,ot,status,punches) VALUES(?,?,?,?,?,?,?,?,?)',
-    newId('LOG-'), id, d, null, null, 0, 0, 'ON_LEAVE', 0);
+  await set('leaves/' + newId('LV-'), {
+    empId: id, type: 'Sudden Leave', startDate: d, endDate: d,
+    reason: 'Marked on leave by employee (no prior application)', status: 'APPROVED', seen: true, seq: Date.now()
+  });
+  await set(`attendance/${id}/${d}`, {
+    id: `${id}__${d}`, empId: id, date: d, clockIn: null, clockOut: null, hours: 0, ot: 0,
+    status: 'ON_LEAVE', punches: 0, breakMin: 0, lunchMin: 0, deduct: 0, seq: Date.now()
+  });
   broadcast(); res.json({ ok: true });
 }));
 
 // Admin manual entry: adds one session to that day and sets the chosen status
 app.post('/api/attendance', auth, adminOnly, h(async (req, res) => {
   const { empId, date, clockIn, clockOut, status } = req.body || {};
-  if (!empId || !date || !validTime(clockIn) || !validTime(clockOut)) return res.status(400).json({ error: 'Employee, date, clock in and clock out are required' });
-  await run('INSERT INTO punches(emp_id,date,punch_in,punch_out) VALUES(?,?,?,?)', empId, date, clockIn, clockOut);
+  if (!empId || !validDate(date) || !validTime(clockIn) || !validTime(clockOut))
+    return res.status(400).json({ error: 'Employee, date, clock in and clock out are required' });
+  if (!okKey(empId) || !(await get('employees/' + empId))) return res.status(400).json({ error: 'Employee not found' });
+  await push(`punches/${empId}/${date}`, { in: clockIn, out: clockOut });
   await recalc(empId, date);
-  if (status) await run('UPDATE attendance SET status=? WHERE emp_id=? AND date=?', status, empId, date);
+  if (status && ['PRESENT', 'LATE', 'ABSENT', 'ON_LEAVE'].includes(status))
+    await update(`attendance/${empId}/${date}`, { status });
   broadcast(); res.json({ ok: true });
 }));
 
+// Deletes the whole day (punches, overtime, breaks and any sudden leave) for that employee
 app.delete('/api/attendance/:id', auth, adminOnly, h(async (req, res) => {
-  const row = await one('SELECT * FROM attendance WHERE id=?', req.params.id);
-  if (row) {
-    await run('DELETE FROM punches WHERE emp_id=? AND date=?', row.emp_id, row.date);
-    await run('DELETE FROM overtime WHERE emp_id=? AND date=?', row.emp_id, row.date);
-    await run('DELETE FROM breaks WHERE emp_id=? AND date=?', row.emp_id, row.date);
-    if (row.status === 'ON_LEAVE')
-      await run("DELETE FROM leaves WHERE emp_id=? AND type='Sudden Leave' AND start_date=? AND end_date=?", row.emp_id, row.date, row.date);
+  const m = /^(.+)__(\d{4}-\d{2}-\d{2})$/.exec(req.params.id);
+  if (!m) return res.status(400).json({ error: 'Bad log id' });
+  const [, empId, date] = m;
+  const row = await get(`attendance/${empId}/${date}`);
+  await Promise.all(['punches', 'overtime', 'breaks', 'attendance'].map(k => remove(`${k}/${empId}/${date}`)));
+  if (row && row.status === 'ON_LEAVE') {
+    for (const l of toList(await get('leaves')).filter(l => l.empId === empId && l.type === 'Sudden Leave' && l.startDate === date && l.endDate === date))
+      await remove('leaves/' + l.key);
   }
-  await run('DELETE FROM attendance WHERE id=?', req.params.id);
   broadcast(); res.json({ ok: true });
 }));
 
 // ---------- LEAVES ----------
 app.post('/api/leaves', auth, empOnly, h(async (req, res) => {
   const { type, startDate, endDate, reason } = req.body || {};
-  const dateOk = d => /^\d{4}-\d{2}-\d{2}$/.test(d || '');
-  if (!type || !dateOk(startDate) || !dateOk(endDate) || !String(reason || '').trim())
+  if (!type || !validDate(startDate) || !validDate(endDate) || !String(reason || '').trim())
     return res.status(400).json({ error: 'Leave type, start date, end date and reason are required' });
   if (endDate < startDate) return res.status(400).json({ error: 'End date cannot be before the start date' });
-  await run('INSERT INTO leaves(id,emp_id,type,start_date,end_date,reason) VALUES(?,?,?,?,?,?)',
-    newId('LV-'), req.user.id, type, startDate, endDate, String(reason).trim());
+  await set('leaves/' + newId('LV-'), {
+    empId: req.user.id, type: String(type), startDate, endDate, reason: String(reason).trim(),
+    status: 'PENDING', seen: false, seq: Date.now()
+  });
   broadcast(); res.json({ ok: true });
 }));
 
+// Admin approves / rejects. seen=false means the employee has not been notified yet.
 app.patch('/api/leaves/:id', auth, adminOnly, h(async (req, res) => {
   const s = (req.body || {}).status;
   if (!['APPROVED', 'REJECTED'].includes(s)) return res.status(400).json({ error: 'Bad status' });
-  await run('UPDATE leaves SET status=?, seen=0 WHERE id=?', s, req.params.id);
+  if (!(await get('leaves/' + req.params.id))) return res.status(404).json({ error: 'Leave request not found' });
+  await update('leaves/' + req.params.id, { status: s, seen: false });
   broadcast(); res.json({ ok: true });
 }));
 
+// Employee closed the notification pop-up
 app.patch('/api/leaves/:id/seen', auth, empOnly, h(async (req, res) => {
-  await run('UPDATE leaves SET seen=1 WHERE id=? AND emp_id=?', req.params.id, req.user.id);
+  const l = await get('leaves/' + req.params.id);
+  if (l && l.empId === req.user.id) await update('leaves/' + req.params.id, { seen: true });
   res.json({ ok: true });
 }));
 
-app.get('/api/version', (req, res) => res.json({ version: '1.7.0', db: 'postgres', features: ['overtime', 'leave-today', 'break-lunch', 'grace', 'shift-hours'] }));
+app.get('/api/version', (req, res) => res.json({ version: '1.8.0', db: 'firebase-realtime-db', features: ['overtime', 'leave-today', 'break-lunch', 'grace', 'shift-hours'] }));
 
 app.use('/api', (req, res) => res.status(404).json({
   error: `API route not found: ${req.method} ${req.originalUrl}. The server is running an old server.js - replace it and restart.`
@@ -441,6 +496,13 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Server error: ' + (err && err.message ? err.message : 'unknown') });
 });
 
-initDb()
-  .then(() => app.listen(PORT, () => console.log(`Attendance system running on port ${PORT} (timezone: ${TZ}, db: postgres)`)))
-  .catch(e => { console.error('Database setup failed:', e); process.exit(1); });
+// Seed the first admin (only when there is none), then start
+(async () => {
+  const admins = await get('admins');
+  if (!admins) {
+    const user = process.env.ADMIN_USER || 'admin@vr';
+    const pass = process.env.ADMIN_PASS || 'RojaRaj@1721';
+    await set('admins/' + encKey(user), { username: user, passwordHash: bcrypt.hashSync(pass, 10) });
+  }
+  app.listen(PORT, () => console.log(`Attendance system running on port ${PORT} (timezone: ${TZ}, db: Firebase Realtime Database)`));
+})().catch(e => { console.error('Firebase connection failed:', e); process.exit(1); });
