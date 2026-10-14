@@ -203,7 +203,7 @@ Today's Live Clock-In Activity Stream
 <table class="w-full text-left border-collapse">
 <thead>
 <tr class="bg-slate-50 border-b border-slate-200 text-xs font-bold text-slate-500 uppercase tracking-wider">
-<th class="py-3.5 px-4">Employee</th><th class="py-3.5 px-4">Regular Hrs</th><th class="py-3.5 px-4">OT Hrs</th><th class="py-3.5 px-4">Base Pay</th><th class="py-3.5 px-4">OT Pay</th><th class="py-3.5 px-4">Total Salary</th><th class="py-3.5 px-4 text-right">Payslip</th>
+<th class="py-3.5 px-4">Employee</th><th class="py-3.5 px-4">Days Worked</th><th class="py-3.5 px-4">Regular Hrs</th><th class="py-3.5 px-4">OT Hrs</th><th class="py-3.5 px-4">Base Pay</th><th class="py-3.5 px-4">OT Pay</th><th class="py-3.5 px-4">Total Salary</th><th class="py-3.5 px-4 text-right">Payslip</th>
 </tr>
 </thead>
 <tbody id="payroll-table-body" class="divide-y divide-slate-100 text-sm"></tbody>
@@ -499,6 +499,7 @@ Today's Live Clock-In Activity Stream
 <thead><tr class="bg-slate-100 font-bold text-slate-700"><th class="p-2">Description</th><th class="p-2 text-center">Hours / Rate</th><th class="p-2 text-right">Amount</th></tr></thead>
 <tbody class="divide-y divide-slate-100">
 <tr><td class="p-2 font-medium">Regular Work Hours</td><td id="payslip-reg-hours" class="p-2 text-center"></td><td id="payslip-base-pay" class="p-2 text-right font-semibold"></td></tr>
+<tr><td class="p-2 font-medium">Days Worked</td><td id="payslip-days" class="p-2 text-center"></td><td class="p-2 text-right text-slate-400">—</td></tr>
 <tr><td class="p-2 font-medium">Overtime Hours (same hourly rate)</td><td id="payslip-ot-hours" class="p-2 text-center"></td><td id="payslip-ot-pay" class="p-2 text-right font-semibold"></td></tr>
 <tr class="bg-slate-50 text-slate-600"><td class="p-2 font-bold" colspan="2">Total Monthly Earnings</td><td id="payslip-gross-pay" class="p-2 text-right font-bold text-slate-900"></td></tr>
 </tbody>
@@ -873,23 +874,28 @@ function renderLeaveRequests() {
 // ===== Payroll =====
 // Regular hours = punched time inside the admin-set shift (calculated by the server).
 // Overtime = only the timing the employee declared, paid at the SAME hourly rate. No deductions.
+// Days worked = number of days in the month with status PRESENT or LATE (late days are worked days too).
 function calcPay(emp, month) {
   const logs = db.attendanceLogs.filter(l => l.empId === emp.id && l.date.startsWith(month));
   const ot = logs.reduce((a, c) => a + (c.overtimeHours || 0), 0);
   const reg = logs.reduce((a, c) => a + (c.hoursWorked || 0), 0);
+  const worked = logs.filter(l => l.status === 'PRESENT' || l.status === 'LATE');
+  const days = worked.length;
+  const late = worked.filter(l => l.status === 'LATE').length;
   const base = reg * emp.hourlyRate, otPay = ot * emp.hourlyRate;
   const total = base + otPay;
-  return { reg, ot, base, otPay, total };
+  return { reg, ot, base, otPay, total, days, late };
 }
 
 function renderPayrollReport() {
   const month = document.getElementById('payroll-month-select').value || getTodayISO().substring(0, 7);
   const tbody = document.getElementById('payroll-table-body');
-  if (!db.employees.length) { tbody.innerHTML = `<tr><td colspan="7" class="p-6 text-center text-slate-400 text-xs">No employees registered yet.</td></tr>`; return; }
+  if (!db.employees.length) { tbody.innerHTML = `<tr><td colspan="8" class="p-6 text-center text-slate-400 text-xs">No employees registered yet.</td></tr>`; return; }
   tbody.innerHTML = db.employees.map(emp => {
     const p = calcPay(emp, month);
     return `<tr class="hover:bg-slate-50">
       <td class="py-3 px-4"><div class="font-bold text-slate-800">${emp.name}</div><div class="text-xs text-slate-400 font-mono">${emp.id} • ₹${emp.hourlyRate}/hr</div></td>
+      <td class="py-3 px-4 font-mono text-xs text-slate-700"><span class="font-bold text-slate-900 text-sm">${p.days}</span> day${p.days === 1 ? '' : 's'}${p.late ? `<div class="text-[10px] text-amber-600 font-semibold">${p.late} late</div>` : ''}</td>
       <td class="py-3 px-4 font-mono text-xs text-slate-700">${fmtHrs(p.reg)}</td>
       <td class="py-3 px-4 font-mono text-xs text-indigo-600 font-bold">${fmtHrs(p.ot)}</td>
       <td class="py-3 px-4 font-mono text-xs text-slate-700">₹${p.base.toFixed(2)}</td>
@@ -902,10 +908,10 @@ function renderPayrollReport() {
 
 function exportPayrollCSV() {
   const month = document.getElementById('payroll-month-select').value || getTodayISO().substring(0, 7);
-  let csv = 'Employee ID,Name,Role,Hourly Rate (INR),Regular Hours,OT Hours,Base Pay,OT Pay,Total Salary\n';
+  let csv = 'Employee ID,Name,Role,Hourly Rate (INR),Days Worked,Late Days,Regular Hours,OT Hours,Base Pay,OT Pay,Total Salary\n';
   db.employees.forEach(e => {
     const p = calcPay(e, month);
-    csv += `"${e.id}","${e.name}","${e.role}",${e.hourlyRate},${p.reg.toFixed(2)},${p.ot.toFixed(2)},${p.base.toFixed(2)},${p.otPay.toFixed(2)},${p.total.toFixed(2)}\n`;
+    csv += `"${e.id}","${e.name}","${e.role}",${e.hourlyRate},${p.days},${p.late},${p.reg.toFixed(2)},${p.ot.toFixed(2)},${p.base.toFixed(2)},${p.otPay.toFixed(2)},${p.total.toFixed(2)}\n`;
   });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
@@ -919,6 +925,7 @@ function openPayslipModal(empId, month) {
   set('payslip-period', month);
   set('payslip-emp-name', emp.name); set('payslip-emp-role', emp.role);
   set('payslip-emp-id', emp.id); set('payslip-emp-dept', emp.dept);
+  set('payslip-days', `${p.days} day${p.days === 1 ? '' : 's'}${p.late ? ` (${p.late} late)` : ''}`);
   set('payslip-reg-hours', `${fmtHrs(p.reg)} @ ₹${emp.hourlyRate.toFixed(2)}/hr`);
   set('payslip-base-pay', `₹${p.base.toFixed(2)}`);
   set('payslip-ot-hours', `${fmtHrs(p.ot)} @ ₹${emp.hourlyRate.toFixed(2)}/hr`);
