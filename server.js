@@ -449,7 +449,7 @@ app.patch('/api/leaves/:id/seen', auth, empOnly, h(async (req, res) => {
   res.json({ ok: true });
 }));
 
-app.get('/api/version', (req, res) => res.json({ version: '1.9.0', db: 'mongodb', features: ['overtime', 'leave-today', 'break-lunch', 'grace', 'shift-hours'] }));
+app.get('/api/version', (req, res) => res.json({ version: '2.0.0', db: 'mongodb', features: ['overtime', 'leave-today', 'break-lunch', 'grace', 'shift-hours', 'days-worked'] }));
 
 app.use('/api', (req, res) => res.status(404).json({
   error: `API route not found: ${req.method} ${req.originalUrl}. The server is running an old server.js - replace it and restart.`
