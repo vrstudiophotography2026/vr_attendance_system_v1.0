@@ -265,12 +265,28 @@
     toast('Overtime recorded', `${fmt12(start)} – ${fmt12(end)} added to today's attendance.`, 'ok');
   };
 
-  // ---------- Break (30 min) / Lunch (1 hr): click to start, click again to end ----------
+  // ---------- Breaks: Morning / Lunch / Evening. Click to start, click again to end ----------
+  // When a break ends, a pop-up shows how long it took and whether it went over the allowed time.
   window.toggleBreak = async kind => {
     if (currentRole === 'admin') return;
     const log = db.attendanceLogs.find(l => l.empId === currentRole && l.date === getTodayISO());
     const active = log && (log.breakSlots || []).find(b => !b.end);
-    await act(() => api(active ? '/break/end' : '/break/start', 'POST', { kind }));
+    await act(() => api(active ? '/break/end' : '/break/start', 'POST', { kind: active ? active.kind : kind }));
+
+    if (!active) return;
+    const log2 = db.attendanceLogs.find(l => l.empId === currentRole && l.date === getTodayISO());
+    const slot = log2 && (log2.breakSlots || []).find(b => b.start === active.start);
+    const st = log2 && log2.breakStats && log2.breakStats[active.kind];
+    if (!slot || !slot.end || !st) return;             // the end request failed (alert already shown)
+    const name = breakLabel(active.kind);
+    const took = fmtDur((slot.end - slot.start) / 60000);
+    if (Math.round(st.overMin * 60) > 0) {
+      toast(`${name} limit exceeded`,
+        `You took ${took} in this break. Total ${name.toLowerCase()} today: ${fmtDur(st.usedMin)} of ${fmtMin(st.allowedMin)} allowed — over by ${fmtDur(st.overMin)}. The extra time is deducted from today's hours.`, 'bad');
+    } else {
+      toast(`${name} ended`,
+        `You took ${took}. Total ${name.toLowerCase()} today: ${fmtDur(st.usedMin)} of ${fmtMin(st.allowedMin)} allowed.`, 'ok');
+    }
   };
 
   // ---------- Sudden leave (no application: today turns red with status LEAVE) ----------
