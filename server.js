@@ -8,9 +8,16 @@ const crypto = require('crypto');
 const SECRET = process.env.JWT_SECRET || 'change-this-secret-in-production';
 // Late rule: LATE only if the first punch-in is MORE than GRACE_MIN minutes after the employee's own shift start
 const GRACE_MIN = Number(process.env.GRACE_MIN ?? 5);
-// Break / lunch allowance per day. Time taken beyond this is deducted from the day's worked hours.
-const BREAK_ALLOWED_MIN = 30;
-const LUNCH_ALLOWED_MIN = 60;
+
+// Scheduled break windows. allowedMin = length of the window = time the employee may take.
+// Time taken beyond allowedMin is flagged as "over" and deducted from the day's worked hours.
+const BREAK_SLOTS = {
+  MORNING: { label: 'Morning Break', from: '11:30', to: '12:30', allowedMin: 60 },
+  LUNCH:   { label: 'Lunch',         from: '13:30', to: '15:00', allowedMin: 90 },
+  EVENING: { label: 'Evening Break', from: '17:00', to: '18:00', allowedMin: 60 }
+};
+// Old records saved before this update used kind 'BREAK' (30 min allowance)
+const kindCfg = k => BREAK_SLOTS[k] || { label: 'Break', from: null, to: null, allowedMin: 30 };
 
 // All punch times and dates use this timezone, no matter where the server runs (Render = UTC)
 const TZ = process.env.APP_TZ || 'Asia/Kolkata';
@@ -30,10 +37,10 @@ const col = name => mdb.collection(name);
 // ---------- DATA LAYOUT (one collection per kind, _id = string) ----------
 // admins      { _id: username, username, passwordHash }
 // employees   { _id: empId, name, passwordHash, dept, role, hourlyRate, workStart, workEnd, joined }
-// attendance  { _id: 'empId__date', empId, date, clockIn, clockOut, hours, ot, status, punches, ... }
+// attendance  { _id: 'empId__date', empId, date, clockIn, clockOut, hours, ot, status, punches, deduct, ... }
 // punches     { _id, empId, date, in, out }
 // overtime    { _id, empId, date, start, end }
-// breaks      { _id, empId, date, kind, start, end }   (start/end are epoch ms)
+// breaks      { _id, empId, date, kind (MORNING|LUNCH|EVENING), start, end }   (start/end are epoch ms)
 // leaves      { _id, empId, type, startDate, endDate, reason, status, seen, seq }
 
 const okKey = s => /^[A-Za-z0-9_-]+$/.test(s);
@@ -79,6 +86,20 @@ function shiftOverlapMin(a, b, ws, we) {
   if (e <= s) e += 1440;
   if (b < a) b += 1440;
   return overlap(a, b, s, e) + overlap(a + 1440, b + 1440, s, e);
+}
+
+// Per-kind break summary for one day: { MORNING: {usedMin, allowedMin, overMin}, LUNCH: {...}, EVENING: {...} }
+// A break that is still running counts up to "now".
+function breakStats(slots, now) {
+  const out = {};
+  Object.keys(BREAK_SLOTS).forEach(k => { out[k] = { usedMin: 0, allowedMin: BREAK_SLOTS[k].allowedMin, overMin: 0 }; });
+  (slots || []).forEach(b => {
+    const m = Math.max(0, ((b.end || now) - b.start) / 60000);
+    const o = (out[b.kind] ||= { usedMin: 0, allowedMin: kindCfg(b.kind).allowedMin, overMin: 0 });
+    o.usedMin += m;
+  });
+  Object.values(out).forEach(o => { o.overMin = Math.max(0, o.usedMin - o.allowedMin); });
+  return out;
 }
 
 // Row -> shape the frontend understands (times are stored/sent as 24h "HH:MM", the UI shows 12h)
@@ -142,6 +163,7 @@ app.get('/api/events', auth, (req, res) => {
 app.get('/api/data', auth, h(async (req, res) => {
   const a = req.user.role === 'admin', id = req.user.id;
   const f = a ? {} : { empId: id };
+  const now = Date.now();
 
   const sess = {};
   (await list('punches', f)).sort(byIn)
@@ -164,8 +186,8 @@ app.get('/api/data', auth, h(async (req, res) => {
       id: `${r.empId}__${r.date}`, empId: r.empId, date: r.date, clockIn: r.clockIn || null, clockOut: r.clockOut || null,
       hoursWorked: r.hours || 0, overtimeHours: r.ot || 0, status: r.status, punches: r.punches || 0,
       sessions: sess[k] || [], overtimeSlots: ots[k] || [],
-      breakMinutes: r.breakMin || 0, lunchMinutes: r.lunchMin || 0, deductedHours: r.deduct || 0,
-      breakSlots: brs[k] || [], _seq: r.seq || 0
+      deductedHours: r.deduct || 0,
+      breakSlots: brs[k] || [], breakStats: breakStats(brs[k] || [], now), _seq: r.seq || 0
     };
   });
   attendanceLogs.sort((x, y) => (x.date < y.date ? 1 : x.date > y.date ? -1 : y._seq - x._seq));
@@ -177,8 +199,8 @@ app.get('/api/data', auth, h(async (req, res) => {
 
   res.json({
     employees, attendanceLogs, leaveRequests,
-    config: { graceMin: GRACE_MIN, breakMin: BREAK_ALLOWED_MIN, lunchMin: LUNCH_ALLOWED_MIN },
-    serverNow: Date.now()
+    config: { graceMin: GRACE_MIN, breaks: BREAK_SLOTS },
+    serverNow: now
   });
 }));
 
@@ -232,7 +254,7 @@ app.delete('/api/employees/:id', auth, adminOnly, h(async (req, res) => {
 
 // Rebuild the daily summary row from that day's punches.
 // - Regular hours = ONLY the punched time that falls inside the admin-set work timing (start-end),
-//   minus break / lunch time that went over the allowance.
+//   minus break time that went over each break's allowance (morning / lunch / evening).
 // - Overtime = ONLY the exact timing the employee declared. Never automatic, never inside the shift.
 // - LATE only if the first punch-in is later than the shift start + GRACE_MIN minutes.
 async function recalc(empId, date) {
@@ -246,13 +268,8 @@ async function recalc(empId, date) {
   const regMin = ps.reduce((a, p) => a + (p.out ? shiftOverlapMin(mins(p.in), mins(p.out), ws, we) : 0), 0);
   const gross = regMin / 60;
 
-  const now = Date.now();
-  let brk = 0, lun = 0;
-  (await dayList('breaks', empId, date)).forEach(b => {
-    const m = Math.max(0, ((b.end || now) - b.start) / 60000);
-    if (b.kind === 'LUNCH') lun += m; else brk += m;
-  });
-  const deduct = (Math.max(0, brk - BREAK_ALLOWED_MIN) + Math.max(0, lun - LUNCH_ALLOWED_MIN)) / 60;
+  const stats = breakStats(await dayList('breaks', empId, date), Date.now());
+  const deduct = Object.values(stats).reduce((a, s) => a + s.overMin, 0) / 60;
   const hours = Math.max(0, gross - deduct);
 
   const ot = (await dayList('overtime', empId, date)).reduce((a, o) => a + hoursBetween(o.start, o.end), 0);
@@ -264,7 +281,7 @@ async function recalc(empId, date) {
   const prev = await col('attendance').findOne({ _id });
   await col('attendance').replaceOne({ _id }, {
     _id, empId, date, clockIn: first, clockOut: out, hours, ot, status, punches: count,
-    breakMin: brk, lunchMin: lun, deduct, seq: (prev && prev.seq) || Date.now()
+    deduct, seq: (prev && prev.seq) || Date.now()
   }, { upsert: true });
 }
 
@@ -278,8 +295,7 @@ async function closeStale(empId) {
   const changedDates = new Set();
 
   for (const b of await list('breaks', { empId, date: { $ne: t }, end: null })) {
-    const allowed = b.kind === 'LUNCH' ? LUNCH_ALLOWED_MIN : BREAK_ALLOWED_MIN;
-    await col('breaks').updateOne({ _id: b.key }, { $set: { end: b.start + allowed * 60000 } });
+    await col('breaks').updateOne({ _id: b.key }, { $set: { end: b.start + kindCfg(b.kind).allowedMin * 60000 } });
     changedDates.add(b.date);
   }
 
@@ -317,7 +333,7 @@ app.post('/api/clock-out', auth, empOnly, h(async (req, res) => {
     if (staleClosed) { broadcast(); return res.json({ ok: true, note: 'Previous open session closed' }); }
     return res.status(400).json({ error: 'You are not punched in.' });
   }
-  await closeBreaks(id, d, Date.now());                       // punching out ends a running break / lunch
+  await closeBreaks(id, d, Date.now());                       // punching out ends a running break
   await col('punches').updateOne({ _id: open.key }, { $set: { out: nowHM() } });
   await recalc(id, d);
   broadcast(); res.json({ ok: true });
@@ -349,11 +365,11 @@ app.post('/api/overtime', auth, empOnly, h(async (req, res) => {
   broadcast(); res.json({ ok: true });
 }));
 
-// ---------- BREAK (30 min) / LUNCH (1 hr) ----------
+// ---------- BREAKS: MORNING (11:30-12:30) / LUNCH (1:30-3:00) / EVENING (5:00-6:00) ----------
 app.post('/api/break/start', auth, empOnly, h(async (req, res) => {
   const id = req.user.id, d = today();
   const kind = String((req.body || {}).kind || '').toUpperCase();
-  if (!['BREAK', 'LUNCH'].includes(kind)) return res.status(400).json({ error: 'Choose break or lunch' });
+  if (!BREAK_SLOTS[kind]) return res.status(400).json({ error: 'Choose morning break, lunch or evening break' });
   await closeStale(id);
   if (await onApprovedLeave(id, d)) return res.status(400).json({ error: 'You are on leave today.' });
   if (!(await dayList('punches', id, d)).some(p => !p.out))
@@ -389,7 +405,7 @@ app.post('/api/leave-today', auth, empOnly, h(async (req, res) => {
   const _id = `${id}__${d}`;
   await col('attendance').replaceOne({ _id }, {
     _id, empId: id, date: d, clockIn: null, clockOut: null, hours: 0, ot: 0,
-    status: 'ON_LEAVE', punches: 0, breakMin: 0, lunchMin: 0, deduct: 0, seq: Date.now()
+    status: 'ON_LEAVE', punches: 0, deduct: 0, seq: Date.now()
   }, { upsert: true });
   broadcast(); res.json({ ok: true });
 }));
@@ -449,7 +465,7 @@ app.patch('/api/leaves/:id/seen', auth, empOnly, h(async (req, res) => {
   res.json({ ok: true });
 }));
 
-app.get('/api/version', (req, res) => res.json({ version: '2.0.0', db: 'mongodb', features: ['overtime', 'leave-today', 'break-lunch', 'grace', 'shift-hours', 'days-worked'] }));
+app.get('/api/version', (req, res) => res.json({ version: '2.1.0', db: 'mongodb', features: ['overtime', 'leave-today', 'scheduled-breaks', 'grace', 'shift-hours', 'days-worked'] }));
 
 app.use('/api', (req, res) => res.status(404).json({
   error: `API route not found: ${req.method} ${req.originalUrl}. The server is running an old server.js - replace it and restart.`
