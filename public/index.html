@@ -31,7 +31,7 @@ tailwind.config = { theme: { extend: { fontFamily: { sans: ['Inter', 'sans-serif
 <div class="bg-blue-600 p-2 rounded-xl text-white shadow-md"><i class="fa-solid me-0 fa-id-card-clip text-xl"></i></div>
 <div>
 <span class="text-xl font-extrabold tracking-tight text-white">VR Studio<span class="text-blue-400">Attendance System</span></span>
-<span class="hidden sm:inline-block text-xs font-semibold uppercase bg-slate-800 text-blue-300 px-2 py-0.5 rounded ml-2 border border-slate-700">Enterprise v3.7</span>
+<span class="hidden sm:inline-block text-xs font-semibold uppercase bg-slate-800 text-blue-300 px-2 py-0.5 rounded ml-2 border border-slate-700">Enterprise v3.8</span>
 </div>
 </div>
 <div class="flex items-center space-x-4">
@@ -162,7 +162,7 @@ Today's Live Clock-In Activity Stream
 <table class="w-full text-left border-collapse">
 <thead>
 <tr class="bg-slate-50 border-b border-slate-200 text-xs font-bold text-slate-500 uppercase tracking-wider">
-<th class="py-3.5 px-4">Date</th><th class="py-3.5 px-4">Employee</th><th class="py-3.5 px-4">Clock In</th><th class="py-3.5 px-4">Clock Out</th><th class="py-3.5 px-4">Hours Worked</th><th class="py-3.5 px-4">Overtime (timing)</th><th class="py-3.5 px-4">Punches (in order)</th><th class="py-3.5 px-4">Status</th><th class="py-3.5 px-4 text-right">Actions</th>
+<th class="py-3.5 px-4">Date</th><th class="py-3.5 px-4">Employee</th><th class="py-3.5 px-4">Clock In</th><th class="py-3.5 px-4">Clock Out</th><th class="py-3.5 px-4">Hours Worked</th><th class="py-3.5 px-4">Breaks Taken</th><th class="py-3.5 px-4">Overtime (timing)</th><th class="py-3.5 px-4">Punches (in order)</th><th class="py-3.5 px-4">Status</th><th class="py-3.5 px-4 text-right">Actions</th>
 </tr>
 </thead>
 <tbody id="logs-table-body" class="divide-y divide-slate-100 text-sm"></tbody>
@@ -262,9 +262,14 @@ Today's Live Clock-In Activity Stream
 <div class="flex justify-between text-slate-600"><span>Punches Today:</span> <span id="kiosk-punch-count" class="font-bold text-slate-800">0</span></div>
 <div class="flex justify-between text-slate-600"><span>Hours Worked Today:</span> <span id="kiosk-hours-today" class="font-bold text-slate-800">0.0 hrs</span></div>
 <div class="flex justify-between text-slate-600 items-start"><span>Overtime Today:</span> <span id="kiosk-ot-today" class="font-bold text-indigo-600 text-right">None</span></div>
-<div class="flex justify-between text-slate-600"><span>Break Used:</span> <span id="kiosk-break-used" class="font-bold text-slate-800">0m / 30m</span></div>
-<div class="flex justify-between text-slate-600"><span>Lunch Used:</span> <span id="kiosk-lunch-used" class="font-bold text-slate-800">0m / 60m</span></div>
+<div class="flex justify-between text-slate-600 items-start"><span>Morning Break <span id="kiosk-win-MORNING" class="text-[10px] text-slate-400"></span>:</span> <span id="kiosk-used-MORNING" class="font-bold text-slate-800 text-right">0m 00s / 60m</span></div>
+<div class="flex justify-between text-slate-600 items-start"><span>Lunch <span id="kiosk-win-LUNCH" class="text-[10px] text-slate-400"></span>:</span> <span id="kiosk-used-LUNCH" class="font-bold text-slate-800 text-right">0m 00s / 90m</span></div>
+<div class="flex justify-between text-slate-600 items-start"><span>Evening Break <span id="kiosk-win-EVENING" class="text-[10px] text-slate-400"></span>:</span> <span id="kiosk-used-EVENING" class="font-bold text-slate-800 text-right">0m 00s / 60m</span></div>
 <div class="flex justify-between text-slate-600"><span>Deducted (over limit):</span> <span id="kiosk-deduct" class="font-bold text-slate-800">None</span></div>
+<div class="pt-2 border-t border-slate-200">
+<div class="text-[10px] font-bold uppercase text-slate-400 mb-1">Today's Breaks (each one)</div>
+<div id="kiosk-break-list"></div>
+</div>
 <div class="pt-2 border-t border-slate-200">
 <div class="text-[10px] font-bold uppercase text-slate-400 mb-1">Today's Punches (in order)</div>
 <div id="kiosk-sessions"></div>
@@ -280,11 +285,12 @@ Today's Live Clock-In Activity Stream
 <button onclick="openOvertimeModal()" id="btn-overtime" title="Add your overtime timing" class="bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white font-bold py-3 px-4 rounded-xl shadow-md transition flex flex-col items-center justify-center space-y-1 opacity-50 cursor-not-allowed" disabled><i class="fa-solid fa-bolt text-lg"></i><span class="text-xs">OVERTIME</span></button>
 <button onclick="markLeaveToday()" id="btn-leave-today" title="Mark yourself on leave for today" class="bg-slate-800 hover:bg-rose-700 active:scale-95 text-white font-bold py-3 px-4 rounded-xl shadow-md transition flex flex-col items-center justify-center space-y-1"><i class="fa-solid fa-umbrella-beach text-lg"></i><span class="text-xs">LEAVE TODAY</span></button>
 </div>
-<div class="grid grid-cols-2 gap-3">
-<button onclick="toggleBreak('BREAK')" id="btn-break" class="bg-amber-500 hover:bg-amber-600 active:scale-95 text-white font-bold py-3 px-4 rounded-xl shadow-md transition flex flex-col items-center justify-center space-y-1 opacity-50 cursor-not-allowed" disabled><i class="fa-solid fa-mug-hot text-lg"></i><span id="btn-break-label" class="text-xs">BREAK (30 MIN)</span></button>
-<button onclick="toggleBreak('LUNCH')" id="btn-lunch" class="bg-orange-600 hover:bg-orange-700 active:scale-95 text-white font-bold py-3 px-4 rounded-xl shadow-md transition flex flex-col items-center justify-center space-y-1 opacity-50 cursor-not-allowed" disabled><i class="fa-solid fa-utensils text-lg"></i><span id="btn-lunch-label" class="text-xs">LUNCH (1 HR)</span></button>
+<div class="grid grid-cols-3 gap-2">
+<button onclick="toggleBreak('MORNING')" id="btn-brk-MORNING" class="bg-amber-500 hover:bg-amber-600 active:scale-95 text-white font-bold py-3 px-2 rounded-xl shadow-md transition flex flex-col items-center justify-center space-y-1 opacity-50 cursor-not-allowed" disabled><i class="fa-solid fa-mug-hot text-lg"></i><span id="lbl-brk-MORNING" class="text-[11px] text-center leading-tight">MORNING BREAK</span><span id="sub-brk-MORNING" class="text-[9px] font-medium opacity-90 text-center leading-tight"></span></button>
+<button onclick="toggleBreak('LUNCH')" id="btn-brk-LUNCH" class="bg-orange-600 hover:bg-orange-700 active:scale-95 text-white font-bold py-3 px-2 rounded-xl shadow-md transition flex flex-col items-center justify-center space-y-1 opacity-50 cursor-not-allowed" disabled><i class="fa-solid fa-utensils text-lg"></i><span id="lbl-brk-LUNCH" class="text-[11px] text-center leading-tight">LUNCH</span><span id="sub-brk-LUNCH" class="text-[9px] font-medium opacity-90 text-center leading-tight"></span></button>
+<button onclick="toggleBreak('EVENING')" id="btn-brk-EVENING" class="bg-teal-600 hover:bg-teal-700 active:scale-95 text-white font-bold py-3 px-2 rounded-xl shadow-md transition flex flex-col items-center justify-center space-y-1 opacity-50 cursor-not-allowed" disabled><i class="fa-solid fa-moon text-lg"></i><span id="lbl-brk-EVENING" class="text-[11px] text-center leading-tight">EVENING BREAK</span><span id="sub-brk-EVENING" class="text-[9px] font-medium opacity-90 text-center leading-tight"></span></button>
 </div>
-<p class="text-[10px] text-slate-400 text-center">Regular hours count only inside your shift timing. Break 30 min and lunch 1 hr are free; extra time is deducted. Overtime counts only the timing you add, outside your shift.</p>
+<p class="text-[10px] text-slate-400 text-center">Regular hours count only inside your shift timing. Morning break 11:30 AM–12:30 PM (1 hr), lunch 1:30–3:00 PM (1.5 hrs), evening break 5:00–6:00 PM (1 hr). Time taken beyond a break's allowed duration is marked as over and deducted. Overtime counts only the timing you add, outside your shift.</p>
 </div>
 </div>
 
@@ -313,7 +319,7 @@ Today's Live Clock-In Activity Stream
 <table class="w-full text-left border-collapse">
 <thead>
 <tr class="bg-slate-50 border-b border-slate-200 text-[11px] font-bold text-slate-500 uppercase tracking-wider sticky top-0">
-<th class="py-3 px-4">Date</th><th class="py-3 px-4">Status</th><th class="py-3 px-4">Overtime (timing)</th>
+<th class="py-3 px-4">Date</th><th class="py-3 px-4">Status</th><th class="py-3 px-4">Breaks Taken</th><th class="py-3 px-4">Overtime (timing)</th>
 </tr>
 </thead>
 <tbody id="emp-personal-logs-body" class="divide-y divide-slate-100 text-xs"></tbody>
@@ -523,7 +529,7 @@ Today's Live Clock-In Activity Stream
 let db = { employees: [], attendanceLogs: [], leaveRequests: [] };
 let currentRole = 'admin';
 let serverOffset = 0;      // server clock minus browser clock (ms), set in backend.js
-let activeBreak = null;    // running break / lunch of the logged-in employee
+let activeBreak = null;    // running break of the logged-in employee
 
 // Timezone used for all clocks and dates (must match APP_TZ in server.js)
 const APP_TZ = 'Asia/Kolkata';
@@ -557,6 +563,11 @@ function fmtHrs(h) {
   return `${Math.floor(t / 60)}h ${pad2(t % 60)}m`;
 }
 const fmtMin = m => `${Math.round(m || 0)}m`;
+// Minutes (can be fractional) as "12m 05s"
+function fmtDur(min) {
+  const t = Math.round((min || 0) * 60);
+  return `${Math.floor(t / 60)}m ${pad2(t % 60)}s`;
+}
 const mmss = sec => {
   sec = Math.max(0, Math.floor(sec));
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), x = sec % 60;
@@ -566,19 +577,57 @@ const fmtMs = ms => new Date(ms).toLocaleTimeString('en-US', { timeZone: APP_TZ,
 const graceMin = () => (db.config && db.config.graceMin != null) ? db.config.graceMin : 5;
 function setGraceLabel() { const el = document.getElementById('grace-label'); if (el) el.innerText = graceMin(); }
 
-// Live timer for a running break / lunch (ticks every second)
+// ===== Break windows: Morning 11:30-12:30, Lunch 1:30-3:00, Evening 5:00-6:00 (config comes from the server) =====
+const BREAK_ORDER = ['MORNING', 'LUNCH', 'EVENING'];
+const BREAK_DEFAULTS = {
+  MORNING: { label: 'Morning Break', from: '11:30', to: '12:30', allowedMin: 60 },
+  LUNCH:   { label: 'Lunch',         from: '13:30', to: '15:00', allowedMin: 90 },
+  EVENING: { label: 'Evening Break', from: '17:00', to: '18:00', allowedMin: 60 }
+};
+const breakCfg = () => (db.config && db.config.breaks) || BREAK_DEFAULTS;
+const breakLabel = k => (breakCfg()[k] || { label: 'Break' }).label;   // old records used kind "BREAK"
+const breakWindow = k => { const c = breakCfg()[k]; return c ? `${fmt12(c.from)} – ${fmt12(c.to)}` : ''; };
+
+// Summary of every break kind used in a day: "Lunch: 1h... 52m 10s / 90m" and red "OVER by ..." when too long
+function breakSummaryHTML(log) {
+  const st = (log && log.breakStats) || {};
+  const rows = Object.keys(st).filter(k => st[k].usedMin > 0.0001).map(k => {
+    const s = st[k], over = Math.round(s.overMin * 60) > 0;
+    return `<div class="text-[10px] whitespace-nowrap ${over ? 'text-rose-600 font-bold' : 'text-slate-600'}">${breakLabel(k)}: ${fmtDur(s.usedMin)} / ${fmtMin(s.allowedMin)}${over ? ` &mdash; OVER by ${fmtDur(s.overMin)}` : ' <span class="text-emerald-600 font-semibold">&#10003; within limit</span>'}</div>`;
+  });
+  return rows.length ? rows.join('') : '<span class="text-slate-300 text-[10px]">No breaks</span>';
+}
+
+// Each individual break of the day: "Lunch 01:35 PM – 02:40 PM (1h 05m)"
+function breakListHTML(log) {
+  const slots = (log && log.breakSlots) || [];
+  if (!slots.length) return '<span class="text-slate-300 text-xs">No breaks taken</span>';
+  const now = Date.now() + serverOffset;
+  return `<ol class="space-y-1">${slots.map((b, i) => {
+    const min = ((b.end || now) - b.start) / 60000;
+    return `<li class="flex items-center gap-1.5 text-[11px] font-mono whitespace-nowrap">
+      <span class="text-slate-400 w-4 text-right">${i + 1}.</span>
+      <span class="px-1.5 rounded font-bold bg-amber-100 text-amber-700">${breakLabel(b.kind)}</span>
+      <span class="text-slate-700 font-semibold">${fmtMs(b.start)} – ${b.end ? fmtMs(b.end) : 'running'}</span>
+      <span class="text-slate-500">(${fmtDur(min)})</span>
+    </li>`;
+  }).join('')}</ol>`;
+}
+
+// Live timer for a running break (ticks every second)
 function updateBreakLive() {
   const box = document.getElementById('break-live'); if (!box) return;
   if (!activeBreak) { box.classList.add('hidden'); return; }
-  const cfg = db.config || { breakMin: 30, lunchMin: 60 };
-  const allow = (activeBreak.kind === 'LUNCH' ? cfg.lunchMin : cfg.breakMin) * 60;
+  const cfg = breakCfg()[activeBreak.kind] || { label: 'Break', allowedMin: 30 };
+  const allow = cfg.allowedMin * 60;
   const elapsed = Math.max(0, (Date.now() + serverOffset - activeBreak.startMs) / 1000);
-  const left = allow - (Math.floor(activeBreak.usedClosed * 60) + Math.floor(elapsed));
+  const used = Math.floor(activeBreak.usedClosed * 60) + Math.floor(elapsed);
+  const left = allow - used;
   const over = left < 0;
   box.className = `mt-4 rounded-xl border p-3 text-center ${over ? 'bg-rose-100 border-rose-400' : 'bg-amber-50 border-amber-300'}`;
-  box.innerHTML = `<div class="text-[11px] font-bold uppercase ${over ? 'text-rose-700' : 'text-amber-700'}">${activeBreak.kind === 'LUNCH' ? 'Lunch' : 'Break'} running</div>
+  box.innerHTML = `<div class="text-[11px] font-bold uppercase ${over ? 'text-rose-700' : 'text-amber-700'}">${cfg.label} running</div>
     <div class="text-3xl font-extrabold font-mono ${over ? 'text-rose-700' : 'text-amber-700'}">${mmss(elapsed)}</div>
-    <div class="text-[11px] font-semibold ${over ? 'text-rose-700' : 'text-amber-700'}">${over ? `Over by ${mmss(-left)} - deducted from today's hours` : `${mmss(left)} left of your allowance`}</div>`;
+    <div class="text-[11px] font-semibold ${over ? 'text-rose-700' : 'text-amber-700'}">${over ? `OVER LIMIT by ${mmss(-left)} (allowed ${fmtMin(cfg.allowedMin)}) - deducted from today's hours` : `${mmss(left)} left of your ${fmtMin(cfg.allowedMin)} allowance`}</div>`;
 }
 function fmtShift(emp) { return `${fmt12(emp.workStart || '09:00')} – ${fmt12(emp.workEnd || '17:00')}`; }
 
@@ -800,7 +849,7 @@ function leaveDayRows(dateFilter) {
     days.filter(d => d >= r.startDate && d <= r.endDate).forEach(d => {
       if (db.attendanceLogs.some(l => l.empId === r.empId && l.date === d)) return;   // real log wins
       rows.push({ id: `LEAVE-${r.id}-${d}`, virtual: true, leave: r, empId: r.empId, date: d,
-        clockIn: null, clockOut: null, hoursWorked: 0, overtimeHours: 0, status: 'ON_LEAVE', punches: 0, sessions: [], overtimeSlots: [] });
+        clockIn: null, clockOut: null, hoursWorked: 0, overtimeHours: 0, status: 'ON_LEAVE', punches: 0, sessions: [], overtimeSlots: [], breakSlots: [], breakStats: {} });
     });
   });
   return rows;
@@ -814,7 +863,7 @@ function renderAttendanceLogs() {
   if (d) logs = logs.filter(l => l.date === d);
   if (st && st !== 'ALL') logs = logs.filter(l => l.status === st);
   logs.sort((x, y) => (x.date < y.date ? 1 : x.date > y.date ? -1 : 0));   // newest first
-  if (!logs.length) { tbody.innerHTML = `<tr><td colspan="9" class="p-6 text-center text-slate-400 text-xs">No attendance logs found matching filters.</td></tr>`; return; }
+  if (!logs.length) { tbody.innerHTML = `<tr><td colspan="10" class="p-6 text-center text-slate-400 text-xs">No attendance logs found matching filters.</td></tr>`; return; }
   const badges = { PRESENT: 'bg-emerald-100 text-emerald-800', LATE: 'bg-amber-100 text-amber-800', ABSENT: 'bg-rose-100 text-rose-800', ON_LEAVE: 'bg-purple-100 text-purple-800' };
   tbody.innerHTML = logs.map(log => {
     const emp = db.employees.find(e => e.id === log.empId) || { name: log.empId };
@@ -827,7 +876,8 @@ function renderAttendanceLogs() {
       <td class="py-3 px-4"><div class="font-bold text-slate-800">${emp.name}</div><div class="text-xs text-slate-400 font-mono">${log.empId}</div>${emp.workStart ? `<div class="text-[10px] text-slate-400">Shift ${fmtShift(emp)}</div>` : ''}</td>
       <td class="py-3 px-4 font-mono text-xs text-slate-700 whitespace-nowrap">${fmt12(log.clockIn)}</td>
       <td class="py-3 px-4 font-mono text-xs text-slate-700 whitespace-nowrap">${fmt12(log.clockOut)}</td>
-      <td class="py-3 px-4 font-mono text-xs text-slate-800 font-bold">${fmtHrs(log.hoursWorked)}${(log.breakMinutes || log.lunchMinutes) ? `<div class="text-[10px] text-slate-400 font-normal">Break ${fmtMin(log.breakMinutes)} • Lunch ${fmtMin(log.lunchMinutes)}</div>` : ''}${log.deductedHours > 0 ? `<div class="text-[10px] text-rose-600 font-semibold">-${fmtHrs(log.deductedHours)} over limit</div>` : ''}</td>
+      <td class="py-3 px-4 font-mono text-xs text-slate-800 font-bold">${fmtHrs(log.hoursWorked)}${log.deductedHours > 0 ? `<div class="text-[10px] text-rose-600 font-semibold">-${fmtHrs(log.deductedHours)} over break limit</div>` : ''}</td>
+      <td class="py-3 px-4 text-xs">${log.virtual ? '<span class="text-slate-300">-</span>' : breakSummaryHTML(log)}${(log.breakSlots || []).length ? `<div class="mt-1.5 border-t border-slate-100 pt-1">${breakListHTML(log)}</div>` : ''}</td>
       <td class="py-3 px-4 text-xs"><div class="font-mono text-indigo-600 font-bold mb-1">${fmtHrs(log.overtimeHours)}</div>${overtimeSlotsHTML(log, 'None')}</td>
       <td class="py-3 px-4 text-xs"><div class="font-bold text-slate-800 mb-1">${punchLabel(log.punches)}</div>${punchListHTML(log)}</td>
       <td class="py-3 px-4"><span class="px-2.5 py-1 text-[11px] rounded-md font-bold ${badges[log.status] || 'bg-slate-100 text-slate-700'}">${log.status}</span>${leaveNote}</td>
@@ -980,7 +1030,7 @@ function renderEmployeeHistory(emp) {
   document.getElementById('emp-sum-away').innerText = c.ABSENT + c.LEAVE;
 
   const tbody = document.getElementById('emp-personal-logs-body');
-  if (!rows.length) { tbody.innerHTML = `<tr><td colspan="3" class="p-4 text-center text-slate-400">No attendance days in this month yet.</td></tr>`; return; }
+  if (!rows.length) { tbody.innerHTML = `<tr><td colspan="4" class="p-4 text-center text-slate-400">No attendance days in this month yet.</td></tr>`; return; }
 
   const badgeCls = {
     PRESENT: 'bg-emerald-100 text-emerald-800', LATE: 'bg-amber-100 text-amber-800',
@@ -992,6 +1042,7 @@ function renderEmployeeHistory(emp) {
     <tr class="align-top ${r.status === 'LEAVE' ? 'bg-rose-50' : 'hover:bg-slate-50'}">
       <td class="py-2.5 px-4"><span class="font-mono font-medium">${r.date}</span> <span class="text-[10px] text-slate-400">${DAY_NAMES[weekdayOf(r.date)]}</span></td>
       <td class="py-2.5 px-4"><span class="px-2 py-0.5 text-[10px] rounded font-bold ${badgeCls[r.status]}">${badgeTxt[r.status] || r.status}</span>${r.status === 'LEAVE' && r.leave ? `<span class="ml-2 text-[10px] text-rose-700 font-semibold">${r.leave.type}</span>` : ''}</td>
+      <td class="py-2.5 px-4">${r.log && r.log.status !== 'ON_LEAVE' ? breakSummaryHTML(r.log) : '<span class="text-slate-300">-</span>'}</td>
       <td class="py-2.5 px-4">${overtimeSlotsHTML(r.log, '-')}</td>
     </tr>`).join('');
 }
@@ -1066,21 +1117,27 @@ function renderEmployeePortal(empId) {
   toggle(bOT, hasPunchesToday && !leaveToday);
   toggle(bLeave, !hasPunchesToday && !leaveToday && !openSess);
 
-  // Break (30 min) and Lunch (1 hr): need a running punch-in today; one running at a time
-  const cfg = db.config || { breakMin: 30, lunchMin: 60 };
+  // Morning break / Lunch / Evening break: need a running punch-in today; one running at a time
+  const bc = breakCfg();
   const slots = log ? (log.breakSlots || []) : [];
+  const stats = log ? (log.breakStats || {}) : {};
   const act = slots.find(b => !b.end) || null;
   const openToday = sess.some(s => !s.out);
-  const bBreak = document.getElementById('btn-break'), bLunch = document.getElementById('btn-lunch');
-  toggle(bBreak, openToday && !leaveToday && (!act || act.kind === 'BREAK'));
-  toggle(bLunch, openToday && !leaveToday && (!act || act.kind === 'LUNCH'));
-  bBreak.classList.toggle('ring-4', !!act && act.kind === 'BREAK'); bBreak.classList.toggle('ring-amber-300', !!act && act.kind === 'BREAK');
-  bLunch.classList.toggle('ring-4', !!act && act.kind === 'LUNCH'); bLunch.classList.toggle('ring-orange-300', !!act && act.kind === 'LUNCH');
-  const lunchLbl = cfg.lunchMin >= 60 ? `${cfg.lunchMin / 60} HR` : `${cfg.lunchMin} MIN`;
-  set('btn-break-label', act && act.kind === 'BREAK' ? 'END BREAK' : `BREAK (${cfg.breakMin} MIN)`);
-  set('btn-lunch-label', act && act.kind === 'LUNCH' ? 'END LUNCH' : `LUNCH (${lunchLbl})`);
-  set('kiosk-break-used', `${fmtMin(log ? log.breakMinutes : 0)} / ${cfg.breakMin}m`);
-  set('kiosk-lunch-used', `${fmtMin(log ? log.lunchMinutes : 0)} / ${cfg.lunchMin}m`);
+  BREAK_ORDER.forEach(k => {
+    const btn = document.getElementById(`btn-brk-${k}`);
+    const running = !!act && act.kind === k;
+    toggle(btn, openToday && !leaveToday && (!act || act.kind === k));
+    btn.classList.toggle('ring-4', running); btn.classList.toggle('ring-slate-300', running);
+    set(`lbl-brk-${k}`, running ? `END ${bc[k].label.toUpperCase()}` : bc[k].label.toUpperCase());
+    set(`sub-brk-${k}`, `${breakWindow(k)} (${fmtMin(bc[k].allowedMin)})`);
+    set(`kiosk-win-${k}`, `(${breakWindow(k)})`);
+    const s = stats[k] || { usedMin: 0, allowedMin: bc[k].allowedMin, overMin: 0 };
+    const over = Math.round(s.overMin * 60) > 0;
+    const el = document.getElementById(`kiosk-used-${k}`);
+    el.innerHTML = `${fmtDur(s.usedMin)} / ${fmtMin(s.allowedMin)}${over ? `<div class="text-[10px] text-rose-600">OVER by ${fmtDur(s.overMin)}</div>` : (s.usedMin > 0 ? '<div class="text-[10px] text-emerald-600">within limit</div>' : '')}`;
+    el.className = `font-bold text-right ${over ? 'text-rose-600' : 'text-slate-800'}`;
+  });
+  document.getElementById('kiosk-break-list').innerHTML = breakListHTML(log);
   const dd = document.getElementById('kiosk-deduct');
   dd.innerText = log && log.deductedHours > 0 ? `-${fmtHrs(log.deductedHours)}` : 'None';
   dd.className = log && log.deductedHours > 0 ? 'font-bold text-rose-600' : 'font-bold text-slate-800';
