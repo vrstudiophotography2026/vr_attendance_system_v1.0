@@ -262,9 +262,9 @@ Today's Live Clock-In Activity Stream
 <div class="flex justify-between text-slate-600"><span>Punches Today:</span> <span id="kiosk-punch-count" class="font-bold text-slate-800">0</span></div>
 <div class="flex justify-between text-slate-600"><span>Hours Worked Today:</span> <span id="kiosk-hours-today" class="font-bold text-slate-800">0.0 hrs</span></div>
 <div class="flex justify-between text-slate-600 items-start"><span>Overtime Today:</span> <span id="kiosk-ot-today" class="font-bold text-indigo-600 text-right">None</span></div>
-<div class="flex justify-between text-slate-600 items-start"><span>Morning Break <span id="kiosk-win-MORNING" class="text-[10px] text-slate-400"></span>:</span> <span id="kiosk-used-MORNING" class="font-bold text-slate-800 text-right">0m 00s / 60m</span></div>
-<div class="flex justify-between text-slate-600 items-start"><span>Lunch <span id="kiosk-win-LUNCH" class="text-[10px] text-slate-400"></span>:</span> <span id="kiosk-used-LUNCH" class="font-bold text-slate-800 text-right">0m 00s / 90m</span></div>
-<div class="flex justify-between text-slate-600 items-start"><span>Evening Break <span id="kiosk-win-EVENING" class="text-[10px] text-slate-400"></span>:</span> <span id="kiosk-used-EVENING" class="font-bold text-slate-800 text-right">0m 00s / 60m</span></div>
+<div class="flex justify-between text-slate-600 items-start"><span>Morning Break <span id="kiosk-win-MORNING" class="text-[10px] text-slate-400"></span>:</span> <span id="kiosk-used-MORNING" class="font-bold text-slate-800 text-right">0m 00s / 30m</span></div>
+<div class="flex justify-between text-slate-600 items-start"><span>Lunch <span id="kiosk-win-LUNCH" class="text-[10px] text-slate-400"></span>:</span> <span id="kiosk-used-LUNCH" class="font-bold text-slate-800 text-right">0m 00s / 60m</span></div>
+<div class="flex justify-between text-slate-600 items-start"><span>Evening Break <span id="kiosk-win-EVENING" class="text-[10px] text-slate-400"></span>:</span> <span id="kiosk-used-EVENING" class="font-bold text-slate-800 text-right">0m 00s / 30m</span></div>
 <div class="flex justify-between text-slate-600"><span>Deducted (over limit):</span> <span id="kiosk-deduct" class="font-bold text-slate-800">None</span></div>
 <div class="pt-2 border-t border-slate-200">
 <div class="text-[10px] font-bold uppercase text-slate-400 mb-1">Today's Breaks (each one)</div>
@@ -290,7 +290,7 @@ Today's Live Clock-In Activity Stream
 <button onclick="toggleBreak('LUNCH')" id="btn-brk-LUNCH" class="bg-orange-600 hover:bg-orange-700 active:scale-95 text-white font-bold py-3 px-2 rounded-xl shadow-md transition flex flex-col items-center justify-center space-y-1 opacity-50 cursor-not-allowed" disabled><i class="fa-solid fa-utensils text-lg"></i><span id="lbl-brk-LUNCH" class="text-[11px] text-center leading-tight">LUNCH</span><span id="sub-brk-LUNCH" class="text-[9px] font-medium opacity-90 text-center leading-tight"></span></button>
 <button onclick="toggleBreak('EVENING')" id="btn-brk-EVENING" class="bg-teal-600 hover:bg-teal-700 active:scale-95 text-white font-bold py-3 px-2 rounded-xl shadow-md transition flex flex-col items-center justify-center space-y-1 opacity-50 cursor-not-allowed" disabled><i class="fa-solid fa-moon text-lg"></i><span id="lbl-brk-EVENING" class="text-[11px] text-center leading-tight">EVENING BREAK</span><span id="sub-brk-EVENING" class="text-[9px] font-medium opacity-90 text-center leading-tight"></span></button>
 </div>
-<p class="text-[10px] text-slate-400 text-center">Regular hours count only inside your shift timing. Morning break 11:30 AM–12:30 PM (1 hr), lunch 1:30–3:00 PM (1.5 hrs), evening break 5:00–6:00 PM (1 hr). Time taken beyond a break's allowed duration is marked as over and deducted. Overtime counts only the timing you add, outside your shift.</p>
+<p class="text-[10px] text-slate-400 text-center">Regular hours count only inside your shift timing. Morning break window 11:30 AM–12:30 PM (30 min allowed), lunch window 1:30–3:00 PM (1 hr allowed), evening break window 5:00–6:00 PM (30 min allowed). Time taken beyond a break's allowed duration is marked as over and deducted. Overtime counts only the timing you add, outside your shift.</p>
 </div>
 </div>
 
@@ -577,18 +577,18 @@ const fmtMs = ms => new Date(ms).toLocaleTimeString('en-US', { timeZone: APP_TZ,
 const graceMin = () => (db.config && db.config.graceMin != null) ? db.config.graceMin : 5;
 function setGraceLabel() { const el = document.getElementById('grace-label'); if (el) el.innerText = graceMin(); }
 
-// ===== Break windows: Morning 11:30-12:30, Lunch 1:30-3:00, Evening 5:00-6:00 (config comes from the server) =====
+// ===== Break windows: Morning 11:30-12:30 (30 min), Lunch 1:30-3:00 (1 hr), Evening 5:00-6:00 (30 min) (config comes from the server) =====
 const BREAK_ORDER = ['MORNING', 'LUNCH', 'EVENING'];
 const BREAK_DEFAULTS = {
-  MORNING: { label: 'Morning Break', from: '11:30', to: '12:30', allowedMin: 60 },
-  LUNCH:   { label: 'Lunch',         from: '13:30', to: '15:00', allowedMin: 90 },
-  EVENING: { label: 'Evening Break', from: '17:00', to: '18:00', allowedMin: 60 }
+  MORNING: { label: 'Morning Break', from: '11:30', to: '12:30', allowedMin: 30 },
+  LUNCH:   { label: 'Lunch',         from: '13:30', to: '15:00', allowedMin: 60 },
+  EVENING: { label: 'Evening Break', from: '17:00', to: '18:00', allowedMin: 30 }
 };
 const breakCfg = () => (db.config && db.config.breaks) || BREAK_DEFAULTS;
 const breakLabel = k => (breakCfg()[k] || { label: 'Break' }).label;   // old records used kind "BREAK"
 const breakWindow = k => { const c = breakCfg()[k]; return c ? `${fmt12(c.from)} – ${fmt12(c.to)}` : ''; };
 
-// Summary of every break kind used in a day: "Lunch: 1h... 52m 10s / 90m" and red "OVER by ..." when too long
+// Summary of every break kind used in a day: "Lunch: 1h... 52m 10s / 60m" and red "OVER by ..." when too long
 function breakSummaryHTML(log) {
   const st = (log && log.breakStats) || {};
   const rows = Object.keys(st).filter(k => st[k].usedMin > 0.0001).map(k => {
