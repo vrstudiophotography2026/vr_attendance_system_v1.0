@@ -9,12 +9,13 @@ const SECRET = process.env.JWT_SECRET || 'change-this-secret-in-production';
 // Late rule: LATE only if the first punch-in is MORE than GRACE_MIN minutes after the employee's own shift start
 const GRACE_MIN = Number(process.env.GRACE_MIN ?? 5);
 
-// Scheduled break windows. allowedMin = length of the window = time the employee may take.
+// Scheduled break windows. from-to = the window in which the break may be taken.
+// allowedMin = how long the employee may actually take (smaller than the window).
 // Time taken beyond allowedMin is flagged as "over" and deducted from the day's worked hours.
 const BREAK_SLOTS = {
-  MORNING: { label: 'Morning Break', from: '11:30', to: '12:30', allowedMin: 60 },
-  LUNCH:   { label: 'Lunch',         from: '13:30', to: '15:00', allowedMin: 90 },
-  EVENING: { label: 'Evening Break', from: '17:00', to: '18:00', allowedMin: 60 }
+  MORNING: { label: 'Morning Break', from: '11:30', to: '12:30', allowedMin: 30 },
+  LUNCH:   { label: 'Lunch',         from: '13:30', to: '15:00', allowedMin: 60 },
+  EVENING: { label: 'Evening Break', from: '17:00', to: '18:00', allowedMin: 30 }
 };
 // Old records saved before this update used kind 'BREAK' (30 min allowance)
 const kindCfg = k => BREAK_SLOTS[k] || { label: 'Break', from: null, to: null, allowedMin: 30 };
@@ -365,7 +366,7 @@ app.post('/api/overtime', auth, empOnly, h(async (req, res) => {
   broadcast(); res.json({ ok: true });
 }));
 
-// ---------- BREAKS: MORNING (11:30-12:30) / LUNCH (1:30-3:00) / EVENING (5:00-6:00) ----------
+// ---------- BREAKS: MORNING (window 11:30-12:30, 30 min) / LUNCH (window 1:30-3:00, 1 hr) / EVENING (window 5:00-6:00, 30 min) ----------
 app.post('/api/break/start', auth, empOnly, h(async (req, res) => {
   const id = req.user.id, d = today();
   const kind = String((req.body || {}).kind || '').toUpperCase();
